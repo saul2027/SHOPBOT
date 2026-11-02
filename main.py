@@ -655,17 +655,23 @@ def cmd_testip(message):
             message,
             f"🌐 IP pública de Railway:\n<code>{esc(ip)}</code>"
         )
+
     except Exception as e:
         bot.reply_to(
             message,
             f"❌ Error: {esc(str(e))}"
         )
-     @bot.message_handler(commands=["testbinance"])
+
+@bot.message_handler(commands=["testbinance"])
 def cmd_testbinance(message):
     if not solo_admin(message):
         return
 
-    msg = bot.reply_to(message, "🧪 Probando conexión con Binance...")
+    msg = bot.reply_to(
+        message,
+        "🧪 Probando conexión con Binance..."
+    )
+
     try:
         ahora = int(time.time() * 1000)
         status, data = _binance_get(
