@@ -638,11 +638,33 @@ def cmd_cmds(message):
         return
     bot.reply_to(message, TEXTO_CMDS_ADMIN, reply_markup=boton_volver_menu())
 
+@bot.message_handler(commands=["testip"])
+def cmd_testip(message):
+    if not solo_admin(message):
+        return
 
-@bot.message_handler(commands=["testbinance"])
+    try:
+        respuesta = requests.get(
+            "https://api.ipify.org?format=json",
+            timeout=10
+        )
+        respuesta.raise_for_status()
+        ip = respuesta.json()["ip"]
+
+        bot.reply_to(
+            message,
+            f"🌐 IP pública de Railway:\n<code>{esc(ip)}</code>"
+        )
+    except Exception as e:
+        bot.reply_to(
+            message,
+            f"❌ Error: {esc(str(e))}"
+        )
+     @bot.message_handler(commands=["testbinance"])
 def cmd_testbinance(message):
     if not solo_admin(message):
         return
+
     msg = bot.reply_to(message, "🧪 Probando conexión con Binance...")
     try:
         ahora = int(time.time() * 1000)
