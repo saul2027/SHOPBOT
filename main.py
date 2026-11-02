@@ -478,20 +478,38 @@ def vista_menu_principal(user):
 
 
 def vista_catalogo():
+    """Catálogo compacto: cantidad con 📦 y estado visual por producto."""
     m = InlineKeyboardMarkup(row_width=1)
     for prod, info in obtener_catalogo().items():
         precio, desc = info["precio"], info["desc"]
         if desc_es_correo(desc, prod):
-            txt = f"🟢 {prod} — {precio:.2f} USDT | ✉️ {desc}"
+            # Solo Canva funciona por activación a correo y no consume stock.
+            disponible = True
+            txt = f"🟢 {prod} | ${precio:.2f} | ✉️ A correo"
         else:
-            disp = contar_stock(prod)
-            txt = (f"🟢 {prod} — {precio:.2f} USDT ({disp} disp.)" if disp > 0
-                   else f"🔴 {prod} — {precio:.2f} USDT (Agotado)")
-        m.add(InlineKeyboardButton(txt, callback_data=f"sel_{prod}"))
-    m.add(InlineKeyboardButton("🏠 Menú Principal", callback_data="inicio"))
-    texto = ("🛒 <b>CATÁLOGO DE PRODUCTOS</b>\n\n"
-             "🟢 Disponible  |  🔴 Agotado\n"
-             "👇 Elige el producto que deseas adquirir:")
+            cantidad = contar_stock(prod)
+            disponible = cantidad > 0
+            txt = f"{'🟢' if disponible else '🔴'} {prod} | ${precio:.2f} | 📦 {cantidad}"
+
+        # Telegram admite botones de estilo en versiones recientes de su API.
+        # Si la versión instalada de pyTelegramBotAPI no expone `style`,
+        # mantenemos el botón normal sin romper el catálogo.
+        try:
+            boton = InlineKeyboardButton(
+                txt, callback_data=f"sel_{prod}",
+                style="success" if disponible else "danger"
+            )
+        except TypeError:
+            boton = InlineKeyboardButton(txt, callback_data=f"sel_{prod}")
+        m.add(boton)
+
+    m.row(InlineKeyboardButton("🏠 Menú Principal", callback_data="inicio"))
+    texto = (
+        "🛒 <b>CATÁLOGO DE PRODUCTOS</b>\n\n"
+        "🟢 Disponible  |  🔴 Agotado\n"
+        "📦 Unidades en stock  |  ✉️ Activación a correo\n\n"
+        "👇 Selecciona el producto que deseas comprar:"
+    )
     return texto, m
 
 
