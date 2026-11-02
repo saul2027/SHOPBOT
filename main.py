@@ -17,6 +17,8 @@ import time
 import hmac
 import html
 import hashlib
+import re
+from decimal import Decimal, InvalidOperation
 from threading import Thread
 from urllib.parse import urlencode
 
@@ -43,10 +45,13 @@ BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "")
 BINANCE_BASE_URL = os.environ.get("BINANCE_BASE_URL", "https://api.binance.com")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 QR_URL = os.environ.get("QR_URL", "https://i.ibb.co/68Hn6Wf/image-2e9128.png")
-TITULAR = "Saul"
+TITULAR = os.environ.get("TITULAR", "SA SHOP")
+# Las API personales de Binance no autorizan automáticamente cobros comerciales.
+# Los pedidos requieren revisión manual hasta integrar Binance Pay Merchant.
+PAYMENT_MODE = "manual"
 
 # Tolerancia de monto (USDT) y ventana de búsqueda en el historial (días)
-TOLERANCIA_MONTO = 0.01
+TOLERANCIA_MONTO = 0.00  # pagos exactos, sin tolerancia
 DIAS_HISTORIAL = 3
 
 CATALOGO_INICIAL = {
@@ -140,6 +145,21 @@ def init_db():
                     producto TEXT PRIMARY KEY,
                     precio REAL,
                     descripcion TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS solicitudes_pago (
+        id BIGSERIAL PRIMARY KEY,
+        order_id TEXT UNIQUE NOT NULL,
+        user_id BIGINT NOT NULL,
+        producto TEXT NOT NULL,
+        cantidad INTEGER NOT NULL,
+        total NUMERIC(20,8) NOT NULL,
+        tipo TEXT NOT NULL,
+        correo TEXT,
+        estado TEXT NOT NULL DEFAULT 'pendiente',
+        credenciales TEXT,
+        creado TIMESTAMPTZ DEFAULT NOW(),
+        actualizado TIMESTAMPTZ DEFAULT NOW()
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_solicitudes_usuario ON solicitudes_pago (user_id, creado DESC)")
     c.execute("SELECT COUNT(*) FROM catalogo_db")
     if c.fetchone()[0] == 0:
         for prod, (precio, desc) in CATALOGO_INICIAL.items():
@@ -264,6 +284,7 @@ def configurar_menu_comandos():
             BotCommand("menu", "🏠 Menú Principal"),
             BotCommand("buy", "🛒 Catálogo de Compras"),
             BotCommand("stock", "📊 Consultar Stock"),
+            BotCommand("mis_entregas", "🔐 Recuperar entregas"),
         ]
         bot.set_my_commands(publicos)
         admin = publicos + [
@@ -277,7 +298,10 @@ def configurar_menu_comandos():
             BotCommand("modificar_descripcion", "📌 Cambiar descripción"),
             BotCommand("noti", "📢 Anuncio Global"),
             BotCommand("stats", "📈 Estadísticas"),
-            BotCommand("testbinance", "🧪 Probar conexión Binance"),
+            BotCommand("testbinance", "🧪 Diagnóstico Binance"),
+            BotCommand("pagos_pendientes", "🧾 Solicitudes pendientes"),
+            BotCommand("aprobar_pago", "✅ Aprobar pago revisado"),
+            BotCommand("rechazar_pago", "⛔ Rechazar pago"),
         ]
         bot.set_my_commands(admin, scope=BotCommandScopeChat(ADMIN_ID))
     except Exception as e:
@@ -436,7 +460,8 @@ def vista_menu_principal(user):
     uid, uname, nombre, _ = obtener_datos_usuario(user.id)
     rango = "👑 ADMINISTRADOR" if uid == ADMIN_ID else "👤 Cliente"
     texto = (
-        "⚡ <b>SA SHOP — TIENDA AUTOMÁTICA 24/7</b> ⚡\n\n"
+        "✦ <b>SA SHOP | DIGITAL STORE</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
         f"┏ 👤 <b>Usuario:</b> {esc(nombre)} (<code>{esc(uname)}</code>)\n"
         f"┣ 🎖️ <b>Rol:</b> {rango}\n"
         f"┗ 🆔 <b>ID:</b> <code>{uid}</code>\n\n"
@@ -465,7 +490,7 @@ def vista_catalogo():
                    else f"🔴 {prod} — {precio:.2f} USDT (Agotado)")
         m.add(InlineKeyboardButton(txt, callback_data=f"sel_{prod}"))
     m.add(InlineKeyboardButton("🏠 Menú Principal", callback_data="inicio"))
-    texto = ("🛒 <b>CATÁLOGO DE PRODUCTOS</b>\n\n"
+    texto = ("✦ <b>CATÁLOGO DIGITAL</b>\n\n"
              "🟢 Disponible  |  🔴 Agotado\n"
              "👇 Elige el producto que deseas adquirir:")
     return texto, m
@@ -495,7 +520,7 @@ def menu_cantidad(producto, cantidad, precio_unit, stock_disp):
 def texto_instrucciones_pago(producto, cantidad, total, correo=None):
     extra = f"📧 Correo: <code>{esc(correo)}</code>\n" if correo else ""
     return (
-        "💎 <b>PAGO DIRECTO CON BINANCE PAY</b> 💎\n\n"
+        "✦ <b>INSTRUCCIONES DE PAGO</b>\n\n"
         f"📦 <b>Producto:</b> {esc(producto)} (x{cantidad})\n{extra}\n"
         "📌 <b>DETALLES DE PAGO:</b>\n"
         "• <b>MÉTODO:</b> Binance Pay\n"
@@ -503,7 +528,7 @@ def texto_instrucciones_pago(producto, cantidad, total, correo=None):
         f"• <b>ID DE BINANCE PAY:</b> <code>{esc(BINANCE_PAY_ID)}</code>\n"
         f"• <b>TITULAR:</b> {TITULAR}\n\n"
         "📸 Escanea el QR o transfiere al ID indicado.\n\n"
-        "👇 Luego pega aquí el <b>ID de orden</b> de tu pago para validarlo y recibir tu entrega automática."
+        "👇 Envía el <b>ID de orden</b> para solicitar la revisión del pago. La entrega se habilita después de su aprobación."
     )
 
 
@@ -538,7 +563,10 @@ TEXTO_CMDS_ADMIN = (
     "• /stats ➔ Métricas de la tienda\n"
     "• /usuarios ➔ Base de clientes en TXT\n\n"
     "🧪 <b>DIAGNÓSTICO</b>\n"
-    "• /testbinance ➔ Probar conexión con Binance"
+    "• /testbinance ➔ Diagnóstico Binance\n"
+    "• /pagos_pendientes ➔ Ver pagos por revisar\n"
+    "• /aprobar_pago NUMERO ➔ Aprobar pago comprobado\n"
+    "• /rechazar_pago NUMERO ➔ Rechazar solicitud"
 )
 
 
@@ -690,6 +718,146 @@ def cmd_testbinance(message):
     except Exception as e:
         texto = f"❌ Error de conexión: <code>{esc(e)}</code>"
     bot.edit_message_text(texto, message.chat.id, msg.message_id, reply_markup=boton_volver_menu())
+
+
+# ================================================================
+# 🛡️ REVISIÓN MANUAL Y ENTREGAS RECUPERABLES
+# ================================================================
+@bot.message_handler(commands=["pagos_pendientes"])
+def cmd_pagos_pendientes(message):
+    if not solo_admin(message):
+        return
+    conn = get_db()
+    try:
+        with conn.cursor() as c:
+            c.execute("""SELECT id,user_id,producto,total,order_id FROM solicitudes_pago
+                         WHERE estado='pendiente' ORDER BY id ASC LIMIT 20""")
+            filas = c.fetchall()
+        texto = "\n".join(
+            f"#{i} | <code>{uid}</code> | {esc(prod)} | {total:.2f} USDT | <code>{esc(oid)}</code>"
+            for i,uid,prod,total,oid in filas) or "Sin solicitudes pendientes."
+        bot.reply_to(message, "🧾 <b>Pagos pendientes</b>\n\n" + texto)
+    finally:
+        conn.close()
+
+
+@bot.message_handler(commands=["rechazar_pago"])
+def cmd_rechazar_pago(message):
+    if not solo_admin(message):
+        return
+    partes = (message.text or "").split()
+    if len(partes) != 2 or not partes[1].isdigit():
+        bot.reply_to(message, "Uso: <code>/rechazar_pago NUMERO</code>")
+        return
+    conn = get_db()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""UPDATE solicitudes_pago SET estado='rechazado', actualizado=NOW()
+                    WHERE id=%s AND estado='pendiente' RETURNING user_id""", (int(partes[1]),))
+                fila = c.fetchone()
+        if not fila:
+            bot.reply_to(message, "No existe una solicitud pendiente con ese número.")
+            return
+        bot.reply_to(message, f"⛔ Solicitud #{partes[1]} rechazada.")
+        try:
+            bot.send_message(fila[0], f"⛔ Tu solicitud de pago #{partes[1]} no fue aprobada. Contacta soporte si necesitas ayuda.")
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+@bot.message_handler(commands=["aprobar_pago"])
+def cmd_aprobar_pago(message):
+    if not solo_admin(message):
+        return
+    partes = (message.text or "").split()
+    if len(partes) != 2 or not partes[1].isdigit():
+        bot.reply_to(message, "Uso: <code>/aprobar_pago NUMERO</code>")
+        return
+    numero = int(partes[1])
+    conn = get_db()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""SELECT user_id,producto,cantidad,total,tipo,correo,order_id,estado
+                    FROM solicitudes_pago WHERE id=%s FOR UPDATE""", (numero,))
+                fila = c.fetchone()
+                if not fila or fila[7] != 'pendiente':
+                    bot.reply_to(message, "Solicitud inexistente o ya procesada.")
+                    return
+                uid,producto,cantidad,total,tipo,correo,oid,_ = fila
+                if tipo == 'stock':
+                    c.execute("""SELECT id,credenciales FROM stock
+                        WHERE producto=%s AND vendido=0 ORDER BY id
+                        LIMIT %s FOR UPDATE SKIP LOCKED""", (producto,cantidad))
+                    articulos = c.fetchall()
+                    if len(articulos) != cantidad:
+                        bot.reply_to(message, "⚠️ No hay stock suficiente. La solicitud sigue pendiente; repón stock o gestiona reembolso.")
+                        return
+                    credenciales = "\n".join(cred for _,cred in articulos)
+                    c.execute("UPDATE stock SET vendido=1 WHERE id=ANY(%s)", ([sid for sid,_ in articulos],))
+                else:
+                    credenciales = f"Activación a correo: {correo}"
+                c.execute("""INSERT INTO pagos_usados (order_id,user_id,monto)
+                    VALUES (%s,%s,%s) ON CONFLICT (order_id) DO NOTHING RETURNING order_id""",
+                    (oid,uid,total))
+                if not c.fetchone():
+                    bot.reply_to(message, "⛔ ID ya consumido. No se entregó nada.")
+                    return
+                c.execute("""INSERT INTO historial_compras (user_id,producto,credenciales,precio)
+                    VALUES (%s,%s,%s,%s)""", (uid,producto,credenciales,total))
+                c.execute("UPDATE usuarios SET compras=compras+1 WHERE user_id=%s", (uid,))
+                c.execute("""UPDATE solicitudes_pago SET estado='aprobado', credenciales=%s,
+                    actualizado=NOW() WHERE id=%s""", (credenciales,numero))
+        # El contenido queda persistido y puede recuperarse con /mis_entregas
+        try:
+            if tipo == 'stock':
+                bot.send_message(uid, f"✅ <b>Pedido #{numero} aprobado</b>\n"
+                    f"📦 {esc(producto)} × {cantidad}\n\n"
+                    f"🔐 <b>Tus accesos:</b>\n<code>{esc(credenciales)}</code>\n\n"
+                    "También puedes recuperarlos con /mis_entregas.")
+            else:
+                bot.send_message(uid, f"✅ <b>Pedido #{numero} aprobado</b>\n"
+                    f"📧 Activación para: <code>{esc(correo)}</code>\n"
+                    "Tu solicitud de activación fue registrada. Contacta soporte para el seguimiento.")
+        except Exception as e:
+            print("Fallo notificación de entrega:", type(e).__name__)
+        bot.reply_to(message, f"✅ Pedido #{numero} aprobado y registrado. El cliente puede consultar /mis_entregas.")
+    except Exception as e:
+        print("Error aprobación:", type(e).__name__, str(e))
+        bot.reply_to(message, "⚠️ Error al procesar la solicitud. Comprueba su estado con /pagos_pendientes.")
+    finally:
+        conn.close()
+
+
+@bot.message_handler(commands=["mis_entregas"])
+def cmd_mis_entregas(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "🔒 Consulta tus entregas únicamente en el chat privado del bot.")
+        return
+    conn = get_db()
+    try:
+        with conn.cursor() as c:
+            c.execute("""SELECT id,producto,cantidad,tipo,credenciales FROM solicitudes_pago
+                WHERE user_id=%s AND estado='aprobado' ORDER BY id DESC LIMIT 5""",
+                (message.from_user.id,))
+            filas = c.fetchall()
+        if not filas:
+            bot.reply_to(message, "📭 No tienes entregas aprobadas todavía.")
+            return
+        for numero,producto,cantidad,tipo,credenciales in filas:
+            if tipo == 'stock':
+                bot.send_message(message.chat.id,
+                    f"📦 <b>Pedido #{numero}</b> — {esc(producto)} × {cantidad}\n"
+                    f"🔐 <code>{esc(credenciales or '')}</code>")
+            else:
+                bot.send_message(message.chat.id,
+                    f"📦 <b>Pedido #{numero}</b> — {esc(producto)}\n"
+                    f"📧 {esc(credenciales or '')}")
+    finally:
+        conn.close()
 
 
 @bot.message_handler(commands=["agregar_plataforma"])
@@ -1247,130 +1415,61 @@ def manejar_entradas(message):
         enviar_pago(message.chat.id, texto_instrucciones_pago(producto, 1, precio, correo=texto))
         return
 
-    # ---------- CLIENTE: verificación del pago ----------
+    # ---------- CLIENTE: solicitud de revisión de pago ----------
     if pend and pend.get("tipo") in ("stock", "pago_correo"):
+        if message.chat.type != "private":
+            bot.reply_to(message, "🔒 Continúa tu compra en el chat privado del bot.")
+            return
         if not es_texto:
-            bot.reply_to(message, "⚠️ Envía el <b>ID de orden</b> como texto para validar tu pago.", reply_markup=boton_volver_menu())
+            bot.reply_to(message, "⚠️ Envía el ID de transacción como texto.")
             return
-
-        order_id = "".join(texto.split())  # quita espacios/saltos
-        if not order_id.isalnum() or len(order_id) < 8:
-            bot.reply_to(message, "⚠️ ID de orden no válido. Copia el <b>ID de orden</b> exacto desde tu comprobante de Binance.", reply_markup=boton_volver_menu())
+        order_id = "".join(texto.split())
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", order_id):
+            bot.reply_to(message, "⚠️ ID inválido. Copia el identificador exacto de Binance.")
             return
-
         producto = pend["producto"]
         cantidad = pend.get("cantidad", 1)
-        total_esperado = cantidad * obtener_precio(producto)
+        total = Decimal(str(pend.get("precio_unit", obtener_precio(producto)))) * cantidad
         tipo = pend["tipo"]
         correo = pend.get("correo")
-
-        # ¿Ya fue usado?
         conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM pagos_usados WHERE order_id = %s", (order_id,))
-        if c.fetchone():
-            c.close()
-            conn.close()
-            bot.reply_to(message, "❌ <b>Este ID de orden ya fue utilizado.</b> No se puede reutilizar un comprobante.", reply_markup=boton_volver_menu())
-            return
-        c.close()
-        conn.close()
-
-        espera = bot.reply_to(message, "⏳ <b>Verificando tu pago en Binance...</b>")
-        ok, resultado = verificar_pago_binance(order_id, total_esperado)
-
-        if not ok:
-            bot.edit_message_text(f"❌ <b>Pago no verificado</b>\n\n{esc(resultado)}", message.chat.id, espera.message_id, reply_markup=boton_volver_menu())
-            return
-
-        monto_pagado = resultado
-        conn = get_db()
-        c = conn.cursor()
         try:
-            # Reservar el order_id de forma atómica (evita doble canje)
-            c.execute("INSERT INTO pagos_usados (order_id, user_id, monto) VALUES (%s, %s, %s) ON CONFLICT (order_id) DO NOTHING",
-                      (order_id, user_id, monto_pagado))
-            if c.rowcount == 0:
-                conn.rollback()
-                bot.edit_message_text("❌ <b>Este ID de orden ya fue utilizado.</b>", message.chat.id, espera.message_id, reply_markup=boton_volver_menu())
+            with conn:
+                with conn.cursor() as c:
+                    c.execute("""INSERT INTO solicitudes_pago
+                        (order_id,user_id,producto,cantidad,total,tipo,correo)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (order_id) DO NOTHING RETURNING id""",
+                        (order_id,user_id,producto,cantidad,total,tipo,correo))
+                    fila = c.fetchone()
+            if not fila:
+                bot.reply_to(message, "⛔ Este ID ya fue registrado. No puede presentarse en otra compra.", reply_markup=boton_volver_menu())
                 return
-
-            # ----- Producto a correo -----
-            if tipo == "pago_correo":
-                c.execute("INSERT INTO historial_compras (user_id, producto, credenciales, precio) VALUES (%s, %s, %s, %s)",
-                          (user_id, producto, f"Activación a correo: {correo}", total_esperado))
-                c.execute("UPDATE usuarios SET compras = compras + 1 WHERE user_id = %s", (user_id,))
-                conn.commit()
-                compras_pendientes.pop(user_id, None)
-
-                bot.edit_message_text(
-                    "✅ <b>¡PAGO VERIFICADO CON ÉXITO!</b>\n\n"
-                    f"📦 Producto: {esc(producto)}\n"
-                    f"📧 Correo: <code>{esc(correo)}</code>\n"
-                    f"💵 Pagado: <code>{monto_pagado:.2f} USDT</code>\n"
-                    f"🧾 Order ID: <code>{order_id}</code>\n\n"
-                    "⏳ Tu activación se procesará de inmediato.",
-                    message.chat.id, espera.message_id, reply_markup=boton_volver_menu(),
-                )
-                uid, uname, nombre, _ = obtener_datos_usuario(user_id)
-                bot.send_message(
-                    ADMIN_ID,
-                    "🔔 <b>NUEVA VENTA VERIFICADA (CORREO)</b>\n\n"
-                    f"👤 {esc(nombre)} (<code>{esc(uname)}</code>)\n🆔 <code>{uid}</code>\n"
-                    f"📦 {esc(producto)}\n📧 <code>{esc(correo)}</code>\n"
-                    f"💵 <code>{monto_pagado:.2f} USDT</code>\n🧾 <code>{order_id}</code>",
-                )
-                return
-
-            # ----- Producto de stock -----
-            c.execute("SELECT id, credenciales FROM stock WHERE producto = %s AND vendido = 0 ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED",
-                      (producto, cantidad))
-            filas = c.fetchall()
-            if len(filas) < cantidad:
-                conn.rollback()  # el pago NO queda consumido
-                bot.edit_message_text(
-                    "⚠️ <b>Pago verificado, pero el stock se agotó justo ahora.</b>\n\n"
-                    f"Contacta al administrador (@{esc(ADMIN_USERNAME.lstrip('@'))}) con tu Order ID <code>{order_id}</code> para reposición o reembolso.",
-                    message.chat.id, espera.message_id, reply_markup=boton_volver_menu(),
-                )
-                bot.send_message(ADMIN_ID, f"⚠️ <b>PAGO SIN STOCK</b>\nUsuario <code>{user_id}</code> pagó <code>{monto_pagado:.2f} USDT</code> por <b>{esc(producto)}</b> x{cantidad}, pero no hay stock.\n🧾 <code>{order_id}</code>")
-                return
-
-            entregadas = []
-            for sid, cred in filas:
-                c.execute("UPDATE stock SET vendido = 1 WHERE id = %s", (sid,))
-                entregadas.append(cred)
-            c.execute("UPDATE usuarios SET compras = compras + 1 WHERE user_id = %s", (user_id,))
-            c.execute("INSERT INTO historial_compras (user_id, producto, credenciales, precio) VALUES (%s, %s, %s, %s)",
-                      (user_id, producto, " | ".join(entregadas), total_esperado))
-            conn.commit()
-            compras_pendientes.pop(user_id, None)
-
-            bloque = "\n".join(f"• <code>{esc(x)}</code>" for x in entregadas)
-            bot.edit_message_text(
-                "🎉 <b>¡PAGO VERIFICADO Y ENTREGA INMEDIATA!</b> 🎉\n\n"
-                f"📦 Producto: <code>{esc(producto)}</code> (x{cantidad})\n"
-                f"💵 Pagado: <code>{monto_pagado:.2f} USDT</code>\n"
-                f"🧾 Order ID: <code>{order_id}</code>\n\n"
-                f"🔑 <b>Tus accesos:</b>\n{bloque}\n\n"
-                "¡Gracias por tu compra en SA SHOP! ⚡",
-                message.chat.id, espera.message_id, reply_markup=boton_volver_menu(),
-            )
-            uid, uname, nombre, _ = obtener_datos_usuario(user_id)
-            bot.send_message(
-                ADMIN_ID,
-                "💰 <b>VENTA AUTOMÁTICA VERIFICADA</b>\n\n"
-                f"👤 {esc(nombre)} (<code>{esc(uname)}</code>)\n"
-                f"📦 {esc(producto)} (x{cantidad})\n"
-                f"💵 <code>{monto_pagado:.2f} USDT</code>\n🧾 <code>{order_id}</code>",
-            )
-        except Exception as e:
-            conn.rollback()
-            print(f"❌ Error procesando compra: {e}")
-            bot.edit_message_text("❌ Ocurrió un error procesando tu compra. No se consumió tu pago; inténtalo de nuevo o contacta soporte.", message.chat.id, espera.message_id, reply_markup=boton_volver_menu())
+        except Exception:
+            bot.reply_to(message, "⚠️ No se pudo registrar la solicitud. Intenta nuevamente.")
+            return
         finally:
-            c.close()
             conn.close()
+        compras_pendientes.pop(user_id, None)
+        bot.reply_to(message,
+            f"🧾 <b>Solicitud #{fila[0]} recibida</b>\n\n"
+            f"📦 {esc(producto)} × {cantidad}\n"
+            f"💵 {total:.2f} USDT\n"
+            f"🔖 ID: <code>{esc(order_id)}</code>\n\n"
+            "⏳ Pendiente de comprobación por el administrador. No se ha aprobado ni entregado el producto.",
+            reply_markup=boton_volver_menu())
+        try:
+            bot.send_message(ADMIN_ID,
+                f"🔔 <b>Nueva solicitud de pago #{fila[0]}</b>\n"
+                f"👤 Usuario: <code>{user_id}</code>\n"
+                f"📦 {esc(producto)} × {cantidad}\n"
+                f"💵 {total:.2f} USDT\n"
+                f"🔖 <code>{esc(order_id)}</code>\n\n"
+                f"Comprueba el abono en tu cuenta y su importe, destinatario, estado y fecha.\n"
+                f"Para aprobar: <code>/aprobar_pago {fila[0]}</code>\n"
+                f"Para rechazar: <code>/rechazar_pago {fila[0]}</code>")
+        except Exception as e:
+            print("No se pudo notificar al admin:", type(e).__name__)
         return
 
     # ---------- Mensajes sueltos ----------
@@ -1386,7 +1485,7 @@ def manejar_entradas(message):
 # =====================================================================
 if __name__ == "__main__":
     keep_alive()
-    print("🚀 SA SHOP Bot iniciado — verificación de pagos vía historial de Binance Pay")
+    print("SA SHOP iniciado — revisión manual de pagos; entrega protegida por PostgreSQL")
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
