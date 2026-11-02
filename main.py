@@ -34,6 +34,60 @@ from telebot.types import (
 )
 
 # =====================================================================
+# 🎨 BOTONES Y CALLBACKS COMPATIBLES
+# =====================================================================
+# Telegram limita callback_data a 64 bytes. Los nombres largos se codifican
+# con un identificador estable, que se resuelve desde el catálogo vigente.
+_TelegramInlineButton = InlineKeyboardButton
+
+def _producto_token(nombre):
+    return hashlib.sha256(nombre.encode("utf-8")).hexdigest()[:20]
+
+def _callback_seguro(callback):
+    if not isinstance(callback, str) or len(callback.encode("utf-8")) <= 64:
+        return callback
+    prefijos = ("sel_", "delplat_", "modnom_", "moddesc_", "prec_",
+                "cargar_", "lotecar_", "cant_mas_", "cant_menos_", "cant_ok_")
+    for prefijo in prefijos:
+        if callback.startswith(prefijo):
+            return prefijo + "#" + _producto_token(callback[len(prefijo):])
+    return callback
+
+def _resolver_callback(callback):
+    if not isinstance(callback, str) or "_#" not in callback:
+        return callback
+    prefijo, token = callback.split("#", 1)
+    for nombre in obtener_catalogo():
+        if _producto_token(nombre) == token:
+            return prefijo + nombre
+    return callback
+
+def InlineKeyboardButton(text, *args, **kwargs):
+    """Aplica colores de forma consistente y limita los callbacks largos."""
+    if "callback_data" in kwargs:
+        kwargs["callback_data"] = _callback_seguro(kwargs["callback_data"])
+    estilo = kwargs.pop("style", None)
+    if estilo is None:
+        cb = str(kwargs.get("callback_data") or "")
+        etiqueta = str(text).lower()
+        if "url" in kwargs:
+            estilo = "primary"
+        elif "agotado" in etiqueta or etiqueta.startswith("🔴") or "❌" in etiqueta or "eliminar" in etiqueta or "vaciar" in etiqueta:
+            estilo = "danger"
+        elif "menú principal" in etiqueta or "volver" in etiqueta or "cancelar" in etiqueta or "perfil" in etiqueta or "soporte" in etiqueta:
+            estilo = "primary"
+        elif "pagar" in etiqueta or "comprar" in etiqueta or "cargar" in etiqueta or "agregar" in etiqueta or "confirmar" in etiqueta:
+            estilo = "success"
+        elif cb.startswith("sel_"):
+            estilo = "success"
+        else:
+            estilo = "primary"
+    try:
+        return _TelegramInlineButton(text, *args, style=estilo, **kwargs)
+    except TypeError:
+        return _TelegramInlineButton(text, *args, **kwargs)
+
+# =====================================================================
 # 🔐 CONFIGURACIÓN (desde variables de entorno)
 # =====================================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -954,9 +1008,23 @@ def callbacks(call):
     user_id = user.id
     chat_id = call.message.chat.id
     msg_id = call.message.message_id
-    data = call.data
+    data = _resolver_callback(call.data)
     registrar_o_actualizar_usuario(user)
 
+    # Responder a la pulsación solo una vez; en productos agotados,
+    # mostrar una alerta visible antes de dar por atendido el callback.
+    if data.startswith("sel_"):
+        producto_alerta = data[4:]
+        cat_alerta = obtener_catalogo()
+        if producto_alerta not in cat_alerta:
+            bot.answer_callback_query(call.id, "Este producto ya no está disponible.", show_alert=True)
+            return
+        if not desc_es_correo(cat_alerta[producto_alerta]["desc"], producto_alerta):
+            if contar_stock(producto_alerta) <= 0:
+                bot.answer_callback_query(call.id,
+                    f"📦 Sin stock: {producto_alerta}. Vuelve a consultar más tarde.",
+                    show_alert=True)
+                return
     try:
         bot.answer_callback_query(call.id)
     except Exception:
