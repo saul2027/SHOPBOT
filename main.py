@@ -177,14 +177,14 @@ def obtener_precio(producto):
     return cat[producto]["precio"] if producto in cat else 0.0
 
 
-def desc_es_correo(desc):
-    d = (desc or "").lower()
-    return "correo" in d or "activación" in d or "activacion" in d
+def desc_es_correo(desc, producto=""):
+    """Solo Canva usa activación a correo; los demás requieren stock."""
+    return "canva" in (producto or "").casefold()
 
 
 def es_producto_a_correo(producto):
     cat = obtener_catalogo()
-    return producto in cat and desc_es_correo(cat[producto]["desc"])
+    return producto in cat and desc_es_correo(cat[producto]["desc"], producto)
 
 
 def registrar_o_actualizar_usuario(user):
@@ -481,7 +481,7 @@ def vista_catalogo():
     m = InlineKeyboardMarkup(row_width=1)
     for prod, info in obtener_catalogo().items():
         precio, desc = info["precio"], info["desc"]
-        if desc_es_correo(desc):
+        if desc_es_correo(desc, prod):
             txt = f"🟢 {prod} — {precio:.2f} USDT | ✉️ {desc}"
         else:
             disp = contar_stock(prod)
@@ -595,7 +595,7 @@ def cmd_stock(message):
     if len(partes) == 1:
         lineas = ["📊 <b>ESTADO DEL INVENTARIO</b>\n"]
         for prod, info in catalogo.items():
-            if desc_es_correo(info["desc"]):
+            if desc_es_correo(info["desc"], prod):
                 lineas.append(f"🟢 <b>{esc(prod)}</b> ➔ <code>{info['precio']:.2f} USDT</code> | ✉️ {esc(info['desc'])}")
             else:
                 cant = contar_stock(prod)
@@ -627,7 +627,7 @@ def cmd_stock(message):
         return
 
     info = catalogo[prod]
-    if desc_es_correo(info["desc"]):
+    if desc_es_correo(info["desc"], prod):
         bot.reply_to(message, f"📦 <b>{esc(prod)}</b>\n💵 Precio: <code>{info['precio']:.2f} USDT</code>\n📌 {esc(info['desc'])}", reply_markup=boton_volver_menu())
         return
 
@@ -765,7 +765,7 @@ def _menu_carga(message, prefijo, titulo):
     m = InlineKeyboardMarkup(row_width=2)
     botones = []
     for prod, info in obtener_catalogo().items():
-        if desc_es_correo(info["desc"]):
+        if desc_es_correo(info["desc"], prod):
             continue
         cant = contar_stock(prod)
         botones.append(InlineKeyboardButton(f"{'🟢' if cant > 0 else '🔴'} {prod} ({cant})", callback_data=f"{prefijo}_{prod}"))
@@ -1026,7 +1026,7 @@ def callbacks(call):
             return
         precio = cat[producto]["precio"]
 
-        if desc_es_correo(cat[producto]["desc"]):
+        if desc_es_correo(cat[producto]["desc"], producto):
             compras_pendientes[user_id] = {"producto": producto, "tipo": "correo"}
             m = InlineKeyboardMarkup()
             m.add(InlineKeyboardButton("❌ Cancelar", callback_data="catalogo"))
