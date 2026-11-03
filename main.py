@@ -28,6 +28,7 @@ import hmac
 import html
 import hashlib
 import logging
+from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from threading import Thread, Lock
@@ -67,6 +68,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 QR_URL = os.environ.get("QR_URL", "https://i.ibb.co/3yz54KHy/qr-binance.jpg")
 TITULAR = os.environ.get("TITULAR", "Saul")
 BOT_THREADS = int(os.environ.get("BOT_THREADS", "16"))
+CANAL_REFERENCIAS = os.environ.get("CANAL_REFERENCIAS", "")      # opcional: ID/@usuario del canal (también se puede fijar con /canal)
+ZONA_HORARIA_UTC = float(os.environ.get("ZONA_HORARIA_UTC", "-5"))  # Perú = -5
 DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", "20"))
 
 CACHE_TTL = 15               # segundos (el caché además se invalida al vender/cargar)
@@ -348,6 +351,8 @@ def init_db():
             c.execute("""CREATE TABLE IF NOT EXISTS entregas_pendientes (
                             order_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, producto TEXT NOT NULL,
                             credenciales TEXT NOT NULL, creado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS ajustes (
+                            clave TEXT PRIMARY KEY, valor TEXT NOT NULL)""")
             c.execute("""CREATE TABLE IF NOT EXISTS iconos (
                             clave TEXT PRIMARY KEY, emoji_id TEXT NOT NULL)""")
             # --- Columnas nuevas (modalidades + stock infinito) ---
@@ -723,6 +728,7 @@ def configurar_menu_comandos():
             BotCommand("cargar", "Subir stock"),
             BotCommand("cargar_lote", "Carga masiva"),
             BotCommand("noti", "Anuncio global"),
+            BotCommand("canal", "Canal de referencias de compras"),
             BotCommand("stats", "Estadísticas"),
             BotCommand("iconos", "Íconos personalizados"),
             BotCommand("testbinance", "Probar Binance"),
@@ -800,6 +806,222 @@ def avisar_admin(texto, markup=None):
         bot.send_message(ADMIN_ID, texto, reply_markup=markup)
     except Exception as e:
         log.error(f"No se pudo avisar al admin: {e}")
+
+
+# =====================================================================
+# 📣 CANAL DE REFERENCIAS DE COMPRAS (100 % automático)
+# =====================================================================
+_ajustes = {}
+
+
+def get_ajuste(clave, defecto=""):
+    if clave in _ajustes:
+        return _ajustes[clave]
+    try:
+        fila = q("SELECT valor FROM ajustes WHERE clave = %s", (clave,), "one")
+        _ajustes[clave] = fila[0] if fila else defecto
+    except Exception:
+        return defecto
+    return _ajustes[clave]
+
+
+def set_ajuste(clave, valor):
+    if valor is None:
+        q("DELETE FROM ajustes WHERE clave = %s", (clave,), fetch=None)
+        _ajustes[clave] = ""
+        return
+    q("INSERT INTO ajustes (clave, valor) VALUES (%s, %s) ON CONFLICT (clave) DO UPDATE SET valor = EXCLUDED.valor",
+      (clave, str(valor)), fetch=None)
+    _ajustes[clave] = str(valor)
+
+
+def canal_id():
+    v = str(get_ajuste("canal_id", "") or CANAL_REFERENCIAS or "").strip()
+    return int(v) if re.fullmatch(r"-?\d+", v) else v
+
+
+def canal_activo():
+    return bool(canal_id()) and get_ajuste("canal_on", "1") == "1"
+
+
+_bot_user = [None]
+
+
+def bot_username():
+    if _bot_user[0] is None:
+        try:
+            _bot_user[0] = bot.get_me().username
+        except Exception:
+            return None
+    return _bot_user[0]
+
+
+def _enmascarar(nombre):
+    n = (nombre or "").strip()
+    if len(n) <= 1:
+        return "Cliente"
+    return f"{n[:2]}{'*' * min(4, max(2, len(n) - 2))}"
+
+
+def texto_referencia(producto, cantidad, monto, mod, nombre, numero, prueba=False):
+    ahora = datetime.now(timezone(timedelta(hours=ZONA_HORARIA_UTC)))
+    entrega = {"correo": "Activación manual a su correo", "dominio": "Entrega manual con el administrador"}.get(mod, "Automática e inmediata")
+    cab = "🧪 <b>PRUEBA · así se verán las referencias</b>\n\n" if prueba else ""
+    return (
+        f"{cab}✅ <b>NUEVA COMPRA VERIFICADA</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🛍 <b>Producto:</b> {esc(producto)}" + (f" (x{cantidad})" if cantidad > 1 else "") + "\n"
+        f"💵 <b>Precio:</b> <code>{float(monto):.2f} USDT</code>\n"
+        f"⚡ <b>Entrega:</b> {entrega}\n"
+        "💎 <b>Pago:</b> Binance Pay · verificado\n"
+        f"👤 <b>Cliente:</b> {esc(_enmascarar(nombre))}\n"
+        f"🕒 <b>Fecha:</b> {ahora:%d/%m/%Y · %H:%M}\n\n"
+        f"🏆 <b>Venta #{numero}</b> · tienda 100 % automática 24/7"
+    )
+
+
+def _teclado_canal():
+    u = bot_username()
+    if not u:
+        return None
+    m = InlineKeyboardMarkup()
+    m.add(btn("🛒 Comprar ahora en el bot", url=f"https://t.me/{u}", style=VERDE))
+    return m
+
+
+_aviso_canal_ts = [0.0]
+
+
+def _publicar_en_canal(texto):
+    destino = canal_id()
+    for intento in (1, 2):
+        try:
+            bot.send_message(destino, texto, reply_markup=_teclado_canal(), disable_web_page_preview=True)
+            return True
+        except ApiTelegramException as e:
+            if e.error_code == 429 and intento == 1:
+                time.sleep(int(getattr(e, "result_json", {}).get("parameters", {}).get("retry_after", 3)) + 1)
+                continue
+            log.error(f"No se pudo publicar en el canal: {e}")
+            if time.time() - _aviso_canal_ts[0] > 1800:
+                _aviso_canal_ts[0] = time.time()
+                avisar_admin("⚠️ <b>No pude publicar en el canal de referencias.</b>\n"
+                             "Revisa que el bot siga siendo <b>administrador</b> con permiso de publicar. Usa /canal para comprobarlo.\n"
+                             f"<code>{esc(str(e)[:200])}</code>")
+            return False
+        except Exception as e:
+            log.error(f"No se pudo publicar en el canal: {e}")
+            return False
+    return False
+
+
+def publicar_referencia(producto, cantidad, monto, mod, nombre):
+    """Publica la venta en el canal sin frenar la entrega al cliente."""
+    if not canal_activo():
+        return
+
+    def _tarea():
+        try:
+            numero = q("SELECT COUNT(*) FROM historial_compras", fetch="one")[0]
+            _publicar_en_canal(texto_referencia(producto, cantidad, monto, mod, nombre, numero))
+        except Exception as e:
+            log.error(f"Referencia no publicada: {e}")
+    Thread(target=_tarea, daemon=True).start()
+
+
+def _estado_permisos_canal():
+    """(ok, texto) — comprueba que el bot es admin del canal y puede publicar."""
+    destino = canal_id()
+    if not destino:
+        return False, "Sin canal conectado"
+    try:
+        chat = bot.get_chat(destino)
+        yo = bot.get_chat_member(chat.id, bot.get_me().id)
+    except Exception as e:
+        return False, f"No puedo acceder al canal ({esc(str(e)[:120])})"
+    titulo = esc(getattr(chat, "title", None) or str(destino))
+    if yo.status not in ("administrator", "creator"):
+        return False, f"{titulo} — el bot NO es administrador"
+    if yo.status == "administrator" and getattr(yo, "can_post_messages", True) is False:
+        return False, f"{titulo} — el bot es admin pero sin permiso de publicar"
+    return True, titulo
+
+
+def vista_canal():
+    destino = canal_id()
+    if not destino:
+        texto = (
+            "📣 <b>CANAL DE REFERENCIAS</b>\n\n"
+            "Cada compra verificada se publica sola en tu canal (producto, precio, entrega, cliente enmascarado).\n\n"
+            "<b>Cómo conectarlo (1 minuto):</b>\n"
+            "1️⃣ Crea tu canal en Telegram.\n"
+            "2️⃣ Canal ➔ Administradores ➔ <b>Añadir administrador</b> ➔ busca este bot y activa <b>Publicar mensajes</b>.\n"
+            "3️⃣ Pulsa <b>Conectar canal</b> y <b>reenvíame cualquier publicación del canal</b> (o escribe su ID <code>-100…</code> / <code>@usuario</code>)."
+        )
+        m = InlineKeyboardMarkup(row_width=1)
+        m.add(btn("Conectar canal", "can:cambiar", style=VERDE, icono="ok"), btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
+        return texto, m
+    ok, detalle = _estado_permisos_canal()
+    on = get_ajuste("canal_on", "1") == "1"
+    texto = (
+        "📣 <b>CANAL DE REFERENCIAS</b>\n\n"
+        f"<b>Canal:</b> {detalle}\n"
+        f"<b>ID:</b> <code>{esc(destino)}</code>\n"
+        f"<b>Permisos del bot:</b> {'✅ correctos' if ok else '❌ revisar'}\n"
+        f"<b>Publicación automática:</b> {'🟢 ACTIVADA' if on else '🔴 PAUSADA'}\n\n"
+        "Cada venta verificada se publica sola. No se muestran cuentas, correos, ni IDs de pago."
+    )
+    m = InlineKeyboardMarkup(row_width=2)
+    m.add(btn("Enviar prueba", "can:probar", style=VERDE, icono="ok"),
+          btn("Pausar" if on else "Activar", "can:onoff", style=ROJO if on else VERDE, icono="error" if on else "ok"),
+          btn("Cambiar canal", "can:cambiar", style=AZUL, icono="link"),
+          btn("Quitar canal", "can:quitar", style=ROJO, icono="error"))
+    m.add(btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
+    return texto, m
+
+
+def flujo_canal(message, st):
+    chat = None
+    fo = getattr(message, "forward_origin", None)
+    if fo is not None and getattr(fo, "chat", None) is not None:
+        chat = fo.chat
+    elif getattr(message, "forward_from_chat", None) is not None:
+        chat = message.forward_from_chat
+    if chat is not None:
+        destino = chat.id
+    else:
+        if message.content_type != "text":
+            bot.reply_to(message, "⚠️ Reenvíame una publicación del canal o escribe su ID/@usuario.", reply_markup=boton_cancelar())
+            return True
+        destino = (message.text or "").strip()
+        if re.fullmatch(r"-?\d{6,}", destino):
+            destino = int(destino)
+        elif re.fullmatch(r"@?[A-Za-z0-9_]{4,}", destino):
+            destino = "@" + destino.lstrip("@")
+        else:
+            bot.reply_to(message, "❌ Formato no válido. Reenvía una publicación del canal o escribe <code>-1001234567890</code> / <code>@micanal</code>.",
+                         reply_markup=boton_cancelar())
+            return True
+    try:
+        info = bot.get_chat(destino)
+        yo = bot.get_chat_member(info.id, bot.get_me().id)
+    except Exception as e:
+        bot.reply_to(message, f"❌ No pude acceder a ese canal. Añade el bot como <b>administrador</b> y vuelve a intentarlo.\n<code>{esc(str(e)[:150])}</code>",
+                     reply_markup=boton_cancelar())
+        return True
+    if getattr(info, "type", "channel") != "channel":
+        bot.reply_to(message, "❌ Eso no es un canal. Crea un <b>canal</b> (no grupo) y reenvíame una publicación suya.", reply_markup=boton_cancelar())
+        return True
+    if yo.status not in ("administrator", "creator") or getattr(yo, "can_post_messages", True) is False:
+        bot.reply_to(message, "❌ El bot no puede publicar ahí. En el canal ➔ Administradores ➔ añade este bot con permiso <b>Publicar mensajes</b> y reenvíame otra publicación.",
+                     reply_markup=boton_cancelar())
+        return True
+    estado.pop(ADMIN_ID, None)
+    set_ajuste("canal_id", info.id)
+    set_ajuste("canal_on", "1")
+    texto, m = vista_canal()
+    bot.reply_to(message, "✅ <b>¡Canal conectado!</b> Desde ahora cada compra se publica sola.\n\n" + texto, reply_markup=m)
+    return True
 
 
 # =====================================================================
@@ -1108,6 +1330,7 @@ def texto_cmds_admin():
         "/vaciar [nombre] ➔ Vaciar el stock no vendido\n\n"
         "<b>📢 COMUNICACIÓN</b>\n"
         "/noti ➔ Anuncio global a todos los clientes\n"
+        "/canal ➔ Canal de referencias de compras (automático)\n"
         "/enviar [ID/@user] ➔ Mensaje privado a un cliente\n\n"
         "<b>👥 CLIENTES Y FINANZAS</b>\n"
         "/historial [ID/@user] ➔ Compras de un cliente\n"
@@ -1528,6 +1751,15 @@ def vista_iconos():
     return texto, m
 
 
+@bot.message_handler(commands=["canal", "referencias"])
+def cmd_canal(message):
+    if not solo_admin(message):
+        return
+    limpiar_estados_usuario(ADMIN_ID)
+    texto, m = vista_canal()
+    bot.reply_to(message, texto, reply_markup=m)
+
+
 @bot.message_handler(commands=["iconos"])
 def cmd_iconos(message):
     if not solo_admin(message):
@@ -1887,6 +2119,28 @@ def _manejar_callback(call, data):
             invalidar_cache()
             return editar(msg, f"🗑️ Se eliminaron <code>{n}</code> cuentas de <b>{esc(nombre)}</b>.", boton_volver_menu())
         return
+
+    # ---- Canal de referencias ----
+    if accion == "can":
+        sub = partes[1] if len(partes) > 1 else ""
+        if sub == "cambiar":
+            set_estado(ADMIN_ID, "canal")
+            return editar(msg, "📣 <b>CONECTAR CANAL</b>\n\nAñade este bot como <b>administrador</b> del canal (permiso <i>Publicar mensajes</i>) y luego "
+                               "<b>reenvíame aquí cualquier publicación del canal</b>.\n\nTambién puedes escribir su ID (<code>-100…</code>) o <code>@usuario</code> si es público.",
+                          boton_cancelar())
+        if sub == "quitar":
+            set_ajuste("canal_id", None)
+            _ajustes["canal_id"] = ""
+        elif sub == "onoff":
+            set_ajuste("canal_on", "0" if get_ajuste("canal_on", "1") == "1" else "1")
+        elif sub == "probar":
+            if not canal_id():
+                return editar(msg, "⚠️ Primero conecta un canal.", boton_volver_menu())
+            ok = _publicar_en_canal(texto_referencia("Producto de ejemplo", 1, 1.00, "auto", "Cliente", 0, prueba=True))
+            bot.send_message(chat_id, "✅ Prueba enviada al canal. Revisa cómo se ve." if ok else
+                             "❌ No se pudo publicar. Revisa que el bot sea administrador con permiso de publicar.")
+        texto, m = vista_canal()
+        return editar(msg, texto, m)
 
     # ---- Resto: acciones sobre una plataforma (token en partes[1]) ----
     nombre = resolver_token(partes[1]) if len(partes) > 1 else None
@@ -2496,6 +2750,7 @@ def procesar_pago(message, st, order_id):
     responder.add(btn("Responder al cliente", f"noti:{uid}", style=VERDE, icono="soporte"))
 
     if resultado_tx == "ok_manual":
+        publicar_referencia(producto, 1, monto_pagado, mod_final, nombre)
         if mod_final == "correo":
             editar_o_enviar(
                 chat_id, espera.message_id,
@@ -2535,6 +2790,7 @@ def procesar_pago(message, st, order_id):
 
     # ok_stock (normal o infinito)
     invalidar_cache()
+    publicar_referencia(producto, cantidad, monto_pagado, "auto", nombre)
     bloque = "\n".join(f"• <code>{esc(x)}</code>" for x in entregadas)
     entregado = editar_o_enviar(
         chat_id, espera.message_id,
@@ -2567,6 +2823,7 @@ FLUJOS = {
     "carga": flujo_carga,
     "inf_activar": flujo_inf_activar,
     "icono": flujo_icono,
+    "canal": flujo_canal,
     "noti_global": flujo_noti_global,
     "noti_botones": flujo_noti_global,
     "noti_user": flujo_noti_user,
