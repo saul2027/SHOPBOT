@@ -12,6 +12,7 @@ Opcionales:
 
 Modalidades de entrega:
   email_pass  -> el stock son líneas  correo@dominio.com:contraseña  (formato validado)
+  key         -> el stock son keys (Windows, Office…) o texto normal, una por línea (o bloques separados por ---)
   link        -> el stock son links   https://...                    (formato validado)
   correo      -> el cliente deja su correo; el admin envía la invitación a mano
   dominio     -> el cliente deja su @usuario de Telegram; el admin entrega a mano
@@ -73,6 +74,7 @@ DIAS_HISTORIAL = 3           # días hacia atrás que se buscan en el historial 
 MAX_CANT_INFINITO = 10       # cantidad máxima por compra en productos de stock infinito
 LIMITE_DESC = 1500           # caracteres máximos de la descripción
 LIMITE_CONTENIDO = 3000      # caracteres máximos del contenido infinito
+LIMITE_KEY = 500             # caracteres máximos de cada key / texto de stock
 ICONOS_ACTIVOS_INICIAL = os.environ.get("ICONOS_PERSONALIZADOS", "1") != "0"
 
 if not TELEGRAM_TOKEN or not DATABASE_URL:
@@ -84,11 +86,12 @@ if not TELEGRAM_TOKEN or not DATABASE_URL:
 MODALIDADES = {
     "email_pass": "Email:Pass · cuenta lista para usar",
     "link": "Link de activación",
+    "key": "Key de activación (Windows, Office…)",
     "correo": "Activación a correo del cliente",
     "dominio": "A dominio · entrega manual",
 }
-MOD_CORTO = {"email_pass": "email:pass", "link": "link", "correo": "a correo", "dominio": "a dominio"}
-ICONO_MOD = {"email_pass": "stock", "link": "link", "correo": "correo", "dominio": "dominio"}
+MOD_CORTO = {"email_pass": "email:pass", "link": "link", "key": "key", "correo": "a correo", "dominio": "a dominio"}
+ICONO_MOD = {"email_pass": "stock", "link": "link", "key": "key", "correo": "correo", "dominio": "dominio"}
 MANUALES = ("correo", "dominio")
 
 # Catálogo inicial (solo se usa si la base de datos está vacía)
@@ -145,12 +148,14 @@ def descripcion_auto(nombre, modalidad, infinito=False):
     formato = {
         "email_pass": "Email:Pass (cuenta completa)",
         "link": "Link de activación" if not infinito else "Link / guía de acceso",
+        "key": "Key de activación / código",
         "correo": "Activación directa a tu correo",
         "dominio": "A dominio (entrega manual)",
     }.get(modalidad, "Cuenta")
     tiempo = {
         "email_pass": "Inmediata, una vez confirmado el pago",
         "link": "Inmediata, una vez confirmado el pago",
+        "key": "Inmediata, una vez confirmado el pago",
         "correo": "Manual: el administrador te envía la invitación tras tu pago",
         "dominio": "Manual: coordinas con el administrador tras tu pago",
     }.get(modalidad, "Inmediata")
@@ -165,6 +170,9 @@ def descripcion_auto(nombre, modalidad, infinito=False):
         ls += ["+ Link de activación personal" if not infinito else "+ Acceso inmediato tras el pago",
                "+ Entrega automática después de la confirmación del pago",
                "- **Sin garantía** después de la entrega"]
+    elif modalidad == "key":
+        ls += ["+ Key de activación lista para usar", "+ Entrega automática después de la confirmación del pago",
+               "- **Sin garantía** después de la entrega"]
     elif modalidad == "correo":
         ls += ["+ Activación directa a tu correo", "+ Te pediremos tu correo al momento de comprar",
                "+ Recibirás un aviso cuando esté listo"]
@@ -178,6 +186,8 @@ def inferir_modalidad(producto, vieja_desc):
     n, d = producto.casefold(), (vieja_desc or "").casefold()
     if "canva" in n or "correo" in d:
         return "correo"
+    if any(k in n for k in ("windows", "office", "licencia", "license", " key", "key ")):
+        return "key"
     if "link" in n or "link" in d or "activacion" in d or "activación" in d or "metodo" in n or "método" in n:
         return "link"
     return "email_pass"
@@ -292,6 +302,33 @@ def q(sql, params=None, fetch="all"):
                 raise
 
 
+def _mantener_conexiones_calientes():
+    """Cada 20 s despierta varias conexiones del pool para que el primer clic nunca espere a la BD."""
+    while True:
+        time.sleep(20)
+        tomadas = []
+        try:
+            for _ in range(min(4, DB_POOL_MAX)):
+                try:
+                    tomadas.append(_tomar_conexion())
+                except Exception:
+                    break
+            for conn in tomadas:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    conn.rollback()
+                except Exception:
+                    pass
+        finally:
+            for conn in tomadas:
+                _last_used[id(conn)] = time.time()
+                try:
+                    _pool.putconn(conn, close=bool(conn.closed))
+                except Exception:
+                    pass
+
+
 def init_db():
     with db() as conn:
         with conn.cursor() as c:
@@ -368,6 +405,7 @@ ICONOS = {
     "correo": ("✉️", "Activación a correo"),
     "dominio": ("🤝", "A dominio"),
     "link": ("🔗", "Link de activación"),
+    "key": ("🔑", "Key de activación"),
     "rayo": ("⚡", "Entrega inmediata"),
     "info": ("ℹ️", "Información"),
 }
@@ -501,8 +539,14 @@ _cat_lock = Lock()
 _ver_lock = Lock()
 
 
+_tok_cache = {}
+
+
 def tok(nombre):
-    return hashlib.sha1(nombre.encode("utf-8")).hexdigest()[:12]
+    t = _tok_cache.get(nombre)
+    if t is None:
+        t = _tok_cache[nombre] = hashlib.sha1(nombre.encode("utf-8")).hexdigest()[:12]
+    return t
 
 
 def _construir_catalogo():
@@ -690,6 +734,9 @@ def configurar_menu_comandos():
 
 
 def _responder(call, texto=None, alerta=False):
+    if getattr(call, "_respondido", False):
+        return
+    call._respondido = True
     try:
         bot.answer_callback_query(call.id, texto, show_alert=alerta)
     except Exception:
@@ -697,7 +744,11 @@ def _responder(call, texto=None, alerta=False):
 
 
 def _responder_async(call, texto=None, alerta=False):
+    """Quita el «cargando» del botón en un hilo aparte, sin frenar la respuesta."""
+    if getattr(call, "_respondido", False):
+        return
     Thread(target=_responder, args=(call, texto, alerta), daemon=True).start()
+    call._respondido = True
 
 
 def _borrar(chat_id, msg_id):
@@ -1212,6 +1263,7 @@ TEXTO_MODALIDADES = (
     "<b>Modalidad de entrega</b>\n\n"
     "• <b>Email:Pass</b> — subes cuentas <code>correo@dominio.com:contraseña</code> y el bot las entrega.\n"
     "• <b>Link de activación</b> — subes links <code>https://...</code> y el bot los entrega.\n"
+    "• <b>Key de activación</b> — subes keys (Windows, Office…) o texto normal y el bot lo entrega tal cual.\n"
     "• <b>A correo</b> — el cliente deja su correo; tú envías la invitación y lo avisas con <i>Responder</i>.\n"
     "• <b>A dominio</b> — el cliente deja su usuario de Telegram; coordinas la entrega manual con él.\n\n"
     "👇 Elige la modalidad:"
@@ -1488,6 +1540,10 @@ def cmd_iconos(message):
 # =====================================================================
 # 🔘 CALLBACKS (botones)
 # =====================================================================
+_ACCIONES_RAPIDAS = {"inicio", "catalogo", "panel_admin", "perfil", "soporte", "noti"}
+_ACCIONES_CON_ALERTA = {"sel", "cant", "pagar", "yp"}
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def callbacks(call):
     data = call.data or ""
@@ -1496,6 +1552,10 @@ def callbacks(call):
 
     if accion == "nada":
         return _responder_async(call)
+
+    # Acciones que nunca muestran alertas: se responde al instante (el botón deja de «cargar» ya).
+    if accion in _ACCIONES_RAPIDAS or (uid == ADMIN_ID and accion not in _ACCIONES_CON_ALERTA):
+        _responder_async(call)
 
     es_cantidad = data.startswith("cant:mas:") or data.startswith("cant:menos:")
     clave = (uid, data)
@@ -1878,6 +1938,12 @@ def _texto_pedir_carga(nombre, info):
         return (f"{ic('link')} <b>Cargando links para:</b> <code>{esc(nombre)}</code>\n\n"
                 "Envía los links de activación, <b>uno por línea</b>. Solo se aceptan links que empiecen con <code>https://</code>.\n\n"
                 "<b>Ejemplo:</b>\n<code>https://ejemplo.com/activar/abc123\nhttps://ejemplo.com/activar/def456</code>")
+    if info["modalidad"] == "key":
+        return (f"{ic('key')} <b>Cargando keys para:</b> <code>{esc(nombre)}</code>\n\n"
+                "Envía las keys o textos, <b>uno por línea</b>. Cada línea se entrega a un comprador, tal cual la escribes.\n"
+                "Si lo que entregas tiene <b>varias líneas</b>, separa cada entrega con una línea <code>---</code>.\n\n"
+                "<b>Ejemplo (una por línea):</b>\n<code>XXXXX-XXXXX-XXXXX-XXXXX-XXXXX\nYYYYY-YYYYY-YYYYY-YYYYY-YYYYY</code>\n\n"
+                "<b>Ejemplo (varias líneas):</b>\n<code>Key: XXXXX-XXXXX-XXXXX\nDescarga: https://sitio.com\n---\nKey: YYYYY-YYYYY-YYYYY\nDescarga: https://sitio.com</code>")
     return (f"{ic('stock')} <b>Cargando cuentas para:</b> <code>{esc(nombre)}</code>\n\n"
             "Envía las cuentas, <b>una por línea</b>, en formato <code>correo:contraseña</code>. Otros formatos serán rechazados.\n\n"
             "<b>Ejemplo:</b>\n<code>usuario1@gmail.com:Clave123\nusuario2@gmail.com:Clave456</code>")
@@ -2107,7 +2173,27 @@ def flujo_agregar(message, st):
 
 
 # ---------- Carga de stock (con validación de formato) ----------
+def partir_keys(texto):
+    """Key: una por línea; o bloques de varias líneas separados por una línea '---'."""
+    lineas = [l.rstrip() for l in texto.split("\n")]
+    if any(re.fullmatch(r"-{3,}", l.strip()) for l in lineas):
+        bloques, actual = [], []
+        for l in lineas:
+            if re.fullmatch(r"-{3,}", l.strip()):
+                bloques.append("\n".join(actual).strip())
+                actual = []
+            else:
+                actual.append(l)
+        bloques.append("\n".join(actual).strip())
+        return [b for b in bloques if b]
+    return [l.strip() for l in lineas if l.strip()]
+
+
 def validar_lineas(modalidad, lineas):
+    if modalidad == "key":
+        validas = [l for l in lineas if len(l) <= LIMITE_KEY]
+        errores = [(n, l) for n, l in enumerate(lineas, 1) if len(l) > LIMITE_KEY]
+        return validas, errores
     regex = RE_EMAIL_PASS if modalidad == "email_pass" else RE_LINK
     validas, errores = [], []
     for n, l in enumerate(lineas, 1):
@@ -2143,13 +2229,14 @@ def flujo_carga(message, st):
         return True
 
     # --- Stock normal: formato validado según la modalidad ---
-    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+    lineas = partir_keys(texto) if info["modalidad"] == "key" else [l.strip() for l in texto.split("\n") if l.strip()]
     if not lineas:
         bot.reply_to(message, "❌ El bloque está vacío.", reply_markup=boton_cancelar())
         return True
     validas, errores = validar_lineas(info["modalidad"], lineas)
     if errores:
         formato = ("<code>correo@dominio.com:contraseña</code>" if info["modalidad"] == "email_pass"
+                   else f"un texto de máximo {LIMITE_KEY} caracteres" if info["modalidad"] == "key"
                    else "un link que empiece con <code>https://</code>")
         detalle = "\n".join(f"{n} ➔ <code>{esc(l[:70])}</code>" for n, l in errores[:10])
         mas = f"\n… y {len(errores) - 10} más" if len(errores) > 10 else ""
@@ -2158,15 +2245,19 @@ def flujo_carga(message, st):
                      f"<b>Líneas con error ({len(errores)}):</b>\n{detalle}{mas}\n\n"
                      "Corrígelas y envía el bloque completo de nuevo.", reply_markup=boton_cancelar())
         return True
-    unicas = list(dict.fromkeys(validas))
+    ya = {r[0] for r in q("SELECT credenciales FROM stock WHERE producto = %s AND vendido = 0", (producto,))}
+    unicas = [l for l in dict.fromkeys(validas) if l not in ya]
     duplicadas = len(validas) - len(unicas)
     estado.pop(ADMIN_ID, None)
+    if not unicas:
+        bot.reply_to(message, "ℹ️ Todo lo enviado ya estaba cargado en el stock. No se agregó nada.", reply_markup=boton_volver_menu())
+        return True
     with db() as conn:
         with conn.cursor() as c:
             execute_values(c, "INSERT INTO stock (producto, credenciales) VALUES %s",
                            [(producto, l) for l in unicas], page_size=500)
     invalidar_cache()
-    dup = f"\n🔁 Se omitieron <code>{duplicadas}</code> líneas repetidas." if duplicadas else ""
+    dup = f"\n🔁 Se omitieron <code>{duplicadas}</code> repetidos (ya existentes o duplicados en el bloque)." if duplicadas else ""
     bot.reply_to(message, f"✅ <b>¡Carga exitosa!</b>\nSe agregaron <code>{len(unicas)}</code> accesos a <b>{esc(producto)}</b>.{dup}", reply_markup=boton_volver_menu())
     return True
 
@@ -2507,6 +2598,7 @@ def manejar_entradas(message):
 if __name__ == "__main__":
     keep_alive()
     Thread(target=configurar_menu_comandos, daemon=True).start()
+    Thread(target=_mantener_conexiones_calientes, daemon=True).start()
     try:
         catalogo_completo()  # precalienta el caché
     except Exception as e:
