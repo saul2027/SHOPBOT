@@ -452,13 +452,17 @@ VERDE, ROJO, AZUL = "success", "danger", "primary"
 _estilo_ok = [True]
 
 
-def btn(texto, cb=None, url=None, style=None, icono=None):
+def btn(texto, cb=None, url=None, style=None, icono=None, final=False, marca=""):
+    """final=True: el ícono va al FINAL del texto (emoji normal); nada antes del texto."""
     kw = {}
     if cb is not None:
         kw["callback_data"] = cb
     if url is not None:
         kw["url"] = url
-    if icono in ICONOS:
+    if final:
+        if icono in ICONOS:
+            texto = f"{texto} {ICONOS[icono][0]}{marca}"
+    elif icono in ICONOS:
         eid = _iconos_ids.get(icono) if _iconos_on[0] else None
         if eid:
             kw["icon_custom_emoji_id"] = eid
@@ -885,7 +889,7 @@ def etiqueta_estado(info):
     if info["infinito"]:
         return f"{ic('infinito')} Ilimitado" if info["tiene_contenido"] else "🔴 Sin contenido cargado"
     n = info["stock"]
-    return f"{'🟢' if n > 0 else '🔴'} {n} disp."
+    return f"{'🟢' if n > 0 else '🔴'} Stock {n}"
 
 
 def vista_menu_principal(user):
@@ -915,22 +919,24 @@ def vista_catalogo(aviso=""):
     m = InlineKeyboardMarkup(row_width=1)
     for prod, info in catalogo_completo().items():
         precio, mod = info["precio"], info["modalidad"]
+        marca = ""
         if mod == "correo":
             txt, ico, est = f"{prod} | ${precio:.2f} | A correo", "correo", VERDE
         elif mod == "dominio":
             txt, ico, est = f"{prod} | ${precio:.2f} | A dominio", "dominio", VERDE
         elif info["infinito"] and info["tiene_contenido"]:
             txt, ico, est = f"{prod} | ${precio:.2f} | Ilimitado", "infinito", AZUL
+            marca = "🟣"
         elif info["disponible"]:
             txt, ico, est = f"{prod} | ${precio:.2f} | {info['stock']}", "stock", VERDE
         else:
             txt, ico, est = f"{prod} | ${precio:.2f} | Sin stock", "error", ROJO
-        m.add(btn(txt, f"sel:{tok(prod)}", style=est, icono=ico))
+        m.add(btn(txt, f"sel:{tok(prod)}", style=est, icono=ico, final=True, marca=marca))
     m.add(btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
     texto = (
         f"{aviso}"
         f"{ic('tienda')} <b>CATÁLOGO DE PRODUCTOS</b>\n\n"
-        "🟢 Disponible   🔴 Sin stock   🔵 Stock ilimitado\n\n"
+        "🟢 Disponible   🔴 Sin stock   🟣 Stock ilimitado\n\n"
         "Selecciona el producto que deseas comprar:"
     )
     return texto, m
@@ -1292,7 +1298,7 @@ def cmd_mod_modalidad(message):
 def cmd_mod_stock(message):
     if solo_admin(message):
         _menu_catalogo_admin(message, "ms", "infinito", "♾️ <b>MODIFICAR STOCK</b>\n\nSelecciona la plataforma:", AZUL,
-                             lambda i: ("infinito" if i["infinito"] else MOD_CORTO[i["modalidad"]] if i["manual"] else f"{i['stock']} disp."))
+                             lambda i: ("infinito" if i["infinito"] else MOD_CORTO[i["modalidad"]] if i["manual"] else f"Stock {i['stock']}"))
 
 
 def _menu_carga(message, prefijo, titulo):
