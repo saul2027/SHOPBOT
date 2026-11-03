@@ -1,30 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 ⚡ SA SHOP — Tienda automática 24/7 para Telegram
-💎 Verificación de pagos con Binance Pay (historial de transacciones recibidas)
+💎 Pagos verificados con Binance Pay (historial de transacciones recibidas)
 
 Variables de entorno requeridas (Railway -> Variables):
   TELEGRAM_TOKEN, ADMIN_ID, ADMIN_USERNAME, BINANCE_PAY_ID,
   BINANCE_API_KEY, BINANCE_SECRET_KEY, DATABASE_URL
 Opcionales:
-  BINANCE_BASE_URL (por defecto https://api.binance.com)
-  QR_URL      (imagen del QR de pago)
-  TITULAR     (nombre mostrado como titular)
-  BOT_THREADS (hilos del bot, por defecto 16)
-  DB_POOL_MAX (conexiones máximas a la BD, por defecto 20)
+  BINANCE_BASE_URL, QR_URL, TITULAR, BOT_THREADS (16), DB_POOL_MAX (20),
+  ICONOS_PERSONALIZADOS (1 = usar íconos premium si los configuras con /iconos, 0 = nunca)
 
-🚀 Optimizaciones de esta versión:
-  • 16 hilos de atención (antes 2): los clics ya no se encolan.
-  • Pool de conexiones a la base de datos (antes: 1 conexión nueva por consulta).
-  • Catálogo + stock en 1 sola consulta, con caché que se invalida al vender/cargar.
-  • Respuesta inmediata a cada botón (se quita el "relojito" al instante).
-  • Anti doble-clic: un doble toque ya no duplica acciones.
-  • Difusiones masivas en segundo plano (no bloquean al bot).
+Modalidades de entrega:
+  email_pass  -> el stock son líneas  correo@dominio.com:contraseña  (formato validado)
+  link        -> el stock son links   https://...                    (formato validado)
+  correo      -> el cliente deja su correo; el admin envía la invitación a mano
+  dominio     -> el cliente deja su @usuario de Telegram; el admin entrega a mano
+Stock infinito (solo email_pass / link): se guarda UN contenido (link o texto) y se entrega igual a todos.
 """
 
 import io
 import os
 import re
+import json
 import time
 import hmac
 import html
@@ -41,6 +38,8 @@ from psycopg2 import pool as pg_pool
 from psycopg2.extras import execute_values
 import requests
 import telebot
+from telebot import apihelper
+from telebot.apihelper import ApiTelegramException
 from flask import Flask
 from telebot.types import (
     InlineKeyboardMarkup,
@@ -54,7 +53,7 @@ log = logging.getLogger("sashop")
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 # =====================================================================
-# 🔐 CONFIGURACIÓN (desde variables de entorno)
+# 🔐 CONFIGURACIÓN
 # =====================================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
@@ -69,24 +68,120 @@ TITULAR = os.environ.get("TITULAR", "Saul")
 BOT_THREADS = int(os.environ.get("BOT_THREADS", "16"))
 DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", "20"))
 
-CACHE_TTL = 15            # segundos (el caché además se invalida al vender/cargar)
-DIAS_HISTORIAL = 3        # días hacia atrás que se buscan en el historial de Binance
-PRODUCTOS_A_CORREO = ("canva",)   # productos de activación a correo (no usan stock)
+CACHE_TTL = 15               # segundos (el caché además se invalida al vender/cargar)
+DIAS_HISTORIAL = 3           # días hacia atrás que se buscan en el historial de Binance
+MAX_CANT_INFINITO = 10       # cantidad máxima por compra en productos de stock infinito
+LIMITE_DESC = 1500           # caracteres máximos de la descripción
+LIMITE_CONTENIDO = 3000      # caracteres máximos del contenido infinito
+ICONOS_ACTIVOS_INICIAL = os.environ.get("ICONOS_PERSONALIZADOS", "1") != "0"
 
 if not TELEGRAM_TOKEN or not DATABASE_URL:
     raise SystemExit("❌ Faltan las variables TELEGRAM_TOKEN y/o DATABASE_URL (Railway -> Variables).")
 
-CATALOGO_INICIAL = {
-    "Gemini Pro link 18 month": (3.00, "link de activacion"),
-    "Max Completa": (1.50, "Cuenta completa email:pass"),
-    "Prime Video 6 month": (2.50, "Cuenta completa email:pass"),
-    "Spotify Individual": (2.00, "Invitación o cuenta email:pass"),
-    "Crunchyroll link 1 Month": (0.50, "Cuenta completa email:pass"),
-    "Canva Pro a correo 12 meses": (1.00, "Activación directa a tu correo"),
-    "Surf Shark 10 dias": (1.00, "Cuenta Privada email:pass"),
-    "Surf Shark 12 meses": (9.00, "Cuenta Privada email:pass"),
-    "Apple TV 1 mes Link": (1.00, "Link de Activacion"),
+# ---------------------------------------------------------------------
+# Modalidades
+# ---------------------------------------------------------------------
+MODALIDADES = {
+    "email_pass": "Email:Pass · cuenta lista para usar",
+    "link": "Link de activación",
+    "correo": "Activación a correo del cliente",
+    "dominio": "A dominio · entrega manual",
 }
+MOD_CORTO = {"email_pass": "email:pass", "link": "link", "correo": "a correo", "dominio": "a dominio"}
+ICONO_MOD = {"email_pass": "stock", "link": "link", "correo": "correo", "dominio": "dominio"}
+MANUALES = ("correo", "dominio")
+
+# Catálogo inicial (solo se usa si la base de datos está vacía)
+CATALOGO_INICIAL = {
+    "Apple TV 1 Mes - Link activación": (1.00, "link", False),
+    "Canva Pro a correo 12 meses": (1.00, "correo", False),
+    "Crunchyroll Link 1 mes - card required": (0.50, "link", False),
+    "Gemini Pro 18 month Link": (3.00, "link", False),
+    "METODO APPLE TV": (3.50, "link", True),
+    "METODO GEMINI PRO + 5TB x 12 Meses": (5.00, "link", True),
+    "Paramount+ 1 Mes": (2.00, "email_pass", False),
+    "Prime Video 6 Meses": (2.00, "email_pass", False),
+    "Spotify Individual": (1.30, "email_pass", False),
+    "Surf Shark VPN 10 days": (1.00, "email_pass", False),
+    "Surf Shark VPN 12 meses": (9.00, "email_pass", False),
+}
+
+# ---------------------------------------------------------------------
+# Validación del stock
+# ---------------------------------------------------------------------
+RE_EMAIL_PASS = re.compile(r"^[^\s:@]+@[^\s:@]+\.[^\s:@]+:\S+$")
+RE_LINK = re.compile(r"^https://\S+$", re.I)
+RE_CORREO = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+RE_USUARIO_TG = re.compile(r"^@?[A-Za-z0-9_]{5,32}$")
+
+# =====================================================================
+# 📝 DESCRIPCIONES AUTOMÁTICAS (puedes cambiarlas con /modificar_descripcion)
+# =====================================================================
+# Sintaxis de la descripción:  "+ texto" = ✅   "- texto" = ❌   "**texto**" = negrita
+_PERFILES = {
+    "surf": ("Surfshark VPN", "Cuenta privada para 10 dispositivos. Empieza a usarla inmediatamente después de la compra.", "10"),
+    "prime": ("Prime Video", "Disfruta Prime Video con una cuenta lista para usar desde el primer momento.", None),
+    "spotify": ("Spotify Premium", "Música sin anuncios en tu cuenta. Empieza a disfrutarla apenas la recibes.", None),
+    "paramount": ("Paramount+", "Acceso a Paramount+ con cuenta lista para usar.", None),
+    "crunchy": ("Crunchyroll", "Anime sin límites. Activa tu acceso siguiendo el link entregado (puede requerir tarjeta para activar).", None),
+    "apple": ("Apple TV+", "Disfruta Apple TV+ activándolo con tu propio link.", None),
+    "gemini": ("Gemini Pro", "Activa Gemini Pro (Google AI) con tu link de activación personal.", None),
+    "canva": ("Canva Pro", "Canva Pro activado directamente en tu correo.", None),
+    "youtube": ("YouTube Premium", "YouTube Premium sin anuncios, agregado a nuestro plan familiar mediante tu correo.", None),
+    "deezer": ("Deezer Premium", "Deezer Premium agregado a nuestro plan mediante tu correo.", None),
+    "max": ("Max", "Cuenta completa de Max lista para usar.", None),
+}
+
+
+def descripcion_auto(nombre, modalidad, infinito=False):
+    n = nombre.casefold()
+    clave = next((k for k in _PERFILES if k in n), None)
+    servicio, blurb, disp = _PERFILES.get(clave, (nombre, f"Acceso a {nombre}.", None))
+    if "metodo" in n or "método" in n:
+        titulo = f"Método {servicio}"
+        blurb = f"Método paso a paso para conseguir {servicio}. Recibes el acceso apenas se confirma el pago."
+    else:
+        titulo = servicio
+    formato = {
+        "email_pass": "Email:Pass (cuenta completa)",
+        "link": "Link de activación" if not infinito else "Link / guía de acceso",
+        "correo": "Activación directa a tu correo",
+        "dominio": "A dominio (entrega manual)",
+    }.get(modalidad, "Cuenta")
+    tiempo = {
+        "email_pass": "Inmediata, una vez confirmado el pago",
+        "link": "Inmediata, una vez confirmado el pago",
+        "correo": "Manual: el administrador te envía la invitación tras tu pago",
+        "dominio": "Manual: coordinas con el administrador tras tu pago",
+    }.get(modalidad, "Inmediata")
+    ls = [f"**{titulo}**", blurb, "", f"**Formato de entrega:** {formato}", f"**Tiempo de entrega:** {tiempo}"]
+    if disp:
+        ls.append(f"**Dispositivos:** {disp}")
+    ls.append("")
+    if modalidad == "email_pass":
+        ls += ["+ Email y Password listos para usar", "+ Entrega automática después de la confirmación del pago",
+               "- **Sin garantía** después de la entrega"]
+    elif modalidad == "link":
+        ls += ["+ Link de activación personal" if not infinito else "+ Acceso inmediato tras el pago",
+               "+ Entrega automática después de la confirmación del pago",
+               "- **Sin garantía** después de la entrega"]
+    elif modalidad == "correo":
+        ls += ["+ Activación directa a tu correo", "+ Te pediremos tu correo al momento de comprar",
+               "+ Recibirás un aviso cuando esté listo"]
+    else:
+        ls += ["+ Cambio de credenciales a tus datos", "+ Tras pagar, contacta directamente con el administrador",
+               "+ Coordinas tus datos de forma segura por Telegram"]
+    return "\n".join(ls)
+
+
+def inferir_modalidad(producto, vieja_desc):
+    n, d = producto.casefold(), (vieja_desc or "").casefold()
+    if "canva" in n or "correo" in d:
+        return "correo"
+    if "link" in n or "link" in d or "activacion" in d or "activación" in d or "metodo" in n or "método" in n:
+        return "link"
+    return "email_pass"
+
 
 # =====================================================================
 # 🌐 MINI SERVIDOR WEB (mantiene vivo el servicio en Railway)
@@ -115,7 +210,6 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML", threaded=True, num_thre
 
 
 def esc(x):
-    """Escapa texto para HTML de Telegram."""
     return html.escape(str(x), quote=False)
 
 
@@ -162,7 +256,7 @@ def _tomar_conexion():
 
 @contextmanager
 def db():
-    """Conexión del pool; confirma (commit) al salir o revierte si hay error."""
+    """Conexión del pool; confirma al salir o revierte si hay error."""
     conn = _tomar_conexion()
     try:
         yield conn
@@ -182,8 +276,7 @@ def db():
 
 
 def q(sql, params=None, fetch="all"):
-    """Consulta con reintento automático si la conexión estaba caída.
-    fetch: 'all' | 'one' | None (devuelve filas afectadas)."""
+    """Consulta con reintento si la conexión estaba caída. fetch: 'all' | 'one' | None (filas afectadas)."""
     for intento in (1, 2):
         try:
             with db() as conn:
@@ -203,50 +296,197 @@ def init_db():
     with db() as conn:
         with conn.cursor() as c:
             c.execute("""CREATE TABLE IF NOT EXISTS usuarios (
-                            user_id BIGINT PRIMARY KEY,
-                            username TEXT,
-                            nombre TEXT,
-                            compras INTEGER DEFAULT 0,
-                            fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+                            user_id BIGINT PRIMARY KEY, username TEXT, nombre TEXT,
+                            compras INTEGER DEFAULT 0, fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             c.execute("""CREATE TABLE IF NOT EXISTS stock (
-                            id SERIAL PRIMARY KEY,
-                            producto TEXT,
-                            credenciales TEXT,
-                            vendido INTEGER DEFAULT 0)""")
+                            id SERIAL PRIMARY KEY, producto TEXT, credenciales TEXT, vendido INTEGER DEFAULT 0)""")
             c.execute("""CREATE TABLE IF NOT EXISTS pagos_usados (
-                            order_id TEXT PRIMARY KEY,
-                            user_id BIGINT,
-                            monto REAL,
+                            order_id TEXT PRIMARY KEY, user_id BIGINT, monto REAL,
                             fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             c.execute("""CREATE TABLE IF NOT EXISTS historial_compras (
-                            id SERIAL PRIMARY KEY,
-                            user_id BIGINT,
-                            producto TEXT,
-                            credenciales TEXT,
-                            precio REAL,
-                            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+                            id SERIAL PRIMARY KEY, user_id BIGINT, producto TEXT, credenciales TEXT,
+                            precio REAL, fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             c.execute("""CREATE TABLE IF NOT EXISTS catalogo_db (
-                            producto TEXT PRIMARY KEY,
-                            precio REAL,
-                            descripcion TEXT)""")
+                            producto TEXT PRIMARY KEY, precio REAL, descripcion TEXT)""")
             c.execute("""CREATE TABLE IF NOT EXISTS entregas_pendientes (
-                            order_id TEXT PRIMARY KEY,
-                            user_id BIGINT NOT NULL,
-                            producto TEXT NOT NULL,
-                            credenciales TEXT NOT NULL,
-                            creado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-            # Índices: consultas de stock e historial mucho más rápidas
+                            order_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, producto TEXT NOT NULL,
+                            credenciales TEXT NOT NULL, creado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS iconos (
+                            clave TEXT PRIMARY KEY, emoji_id TEXT NOT NULL)""")
+            # --- Columnas nuevas (modalidades + stock infinito) ---
+            c.execute("ALTER TABLE catalogo_db ADD COLUMN IF NOT EXISTS modalidad TEXT")
+            c.execute("ALTER TABLE catalogo_db ADD COLUMN IF NOT EXISTS infinito BOOLEAN DEFAULT FALSE")
+            c.execute("ALTER TABLE catalogo_db ADD COLUMN IF NOT EXISTS entrega_infinita TEXT")
             c.execute("CREATE INDEX IF NOT EXISTS idx_stock_prod_vendido ON stock (producto, vendido)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_hist_user ON historial_compras (user_id)")
+
             c.execute("SELECT COUNT(*) FROM catalogo_db")
             if c.fetchone()[0] == 0:
-                for prod, (precio, desc) in CATALOGO_INICIAL.items():
+                for prod, (precio, mod, inf) in CATALOGO_INICIAL.items():
                     c.execute(
-                        "INSERT INTO catalogo_db (producto, precio, descripcion) VALUES (%s, %s, %s) "
-                        "ON CONFLICT (producto) DO NOTHING", (prod, precio, desc))
+                        "INSERT INTO catalogo_db (producto, precio, descripcion, modalidad, infinito) "
+                        "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (producto) DO NOTHING",
+                        (prod, precio, descripcion_auto(prod, mod, inf), mod, inf))
+
+            # --- Migración de plataformas antiguas (se hace una sola vez por plataforma) ---
+            c.execute("SELECT producto, descripcion FROM catalogo_db WHERE modalidad IS NULL")
+            for prod, vieja in c.fetchall():
+                mod = inferir_modalidad(prod, vieja)
+                inf = ("metodo" in prod.casefold() or "método" in prod.casefold()) and mod in ("link", "email_pass")
+                contenido = None
+                if inf:
+                    c.execute("SELECT credenciales FROM stock WHERE producto = %s AND vendido = 0 ORDER BY id LIMIT 1", (prod,))
+                    fila = c.fetchone()
+                    contenido = fila[0] if fila else None
+                c.execute("UPDATE catalogo_db SET modalidad = %s, infinito = %s, entrega_infinita = %s, descripcion = %s "
+                          "WHERE producto = %s",
+                          (mod, inf, contenido, descripcion_auto(prod, mod, inf), prod))
+                log.info(f"Plataforma migrada: {prod} -> {mod}{' (infinito)' if inf else ''}")
 
 
 init_db()
+
+
+# =====================================================================
+# 🎨 ÍCONOS PERSONALIZADOS (emojis premium) — se asignan con /iconos
+# =====================================================================
+# Sin íconos asignados, el bot usa los emojis normales de abajo (funciona igual).
+ICONOS = {
+    "tienda": ("🛍️", "Tienda / catálogo"),
+    "perfil": ("👤", "Mi perfil"),
+    "soporte": ("💬", "Soporte / contacto"),
+    "menu": ("🏠", "Menú principal"),
+    "admin": ("👑", "Panel de admin"),
+    "pagar": ("💳", "Pagar"),
+    "ok": ("✅", "Confirmado / check"),
+    "error": ("❌", "Cancelar / error"),
+    "volver": ("⬅️", "Volver"),
+    "mas": ("➕", "Agregar"),
+    "menos": ("➖", "Quitar"),
+    "stock": ("📦", "Stock / cantidad"),
+    "infinito": ("♾️", "Stock infinito"),
+    "correo": ("✉️", "Activación a correo"),
+    "dominio": ("🤝", "A dominio"),
+    "link": ("🔗", "Link de activación"),
+    "rayo": ("⚡", "Entrega inmediata"),
+    "info": ("ℹ️", "Información"),
+}
+_iconos_ids = {}
+_iconos_on = [ICONOS_ACTIVOS_INICIAL]
+
+
+def cargar_iconos():
+    try:
+        for clave, eid in q("SELECT clave, emoji_id FROM iconos"):
+            if clave in ICONOS:
+                _iconos_ids[clave] = eid
+    except Exception as e:
+        log.warning(f"No se pudieron cargar los íconos: {e}")
+
+
+cargar_iconos()
+
+
+def ic(clave):
+    """Ícono para TEXTOS: emoji premium (si está asignado) o emoji normal."""
+    fb = ICONOS[clave][0]
+    eid = _iconos_ids.get(clave)
+    if eid and _iconos_on[0]:
+        return f'<tg-emoji emoji-id="{eid}">{fb}</tg-emoji>'
+    return fb
+
+
+# --- Red de seguridad: si Telegram rechaza los íconos premium, se quitan y se reintenta ---
+_RE_TGEMOJI = re.compile(r'<tg-emoji emoji-id="[^"]*">(.*?)</tg-emoji>', re.S)
+_orig_make_request = apihelper._make_request
+
+
+def _tiene_iconos(params):
+    if not isinstance(params, dict):
+        return False
+    texto = f"{params.get('reply_markup', '')}{params.get('text', '')}{params.get('caption', '')}"
+    return "icon_custom_emoji_id" in texto or "<tg-emoji" in texto
+
+
+def _quitar_iconos(params):
+    p = dict(params)
+    rm = p.get("reply_markup")
+    if rm:
+        try:
+            d = json.loads(rm) if isinstance(rm, str) else rm
+            for fila in d.get("inline_keyboard", []):
+                for b in fila:
+                    b.pop("icon_custom_emoji_id", None)
+            p["reply_markup"] = json.dumps(d) if isinstance(rm, str) else d
+        except Exception:
+            pass
+    for k in ("text", "caption"):
+        if isinstance(p.get(k), str):
+            p[k] = _RE_TGEMOJI.sub(r"\1", p[k])
+    return p
+
+
+def _make_request_seguro(token, method_name, method="get", params=None, files=None):
+    try:
+        return _orig_make_request(token, method_name, method, params, files)
+    except ApiTelegramException as e:
+        desc = (getattr(e, "description", "") or "").lower()
+        if (e.error_code == 400 and _tiene_iconos(params)
+                and any(k in desc for k in ("emoji", "icon", "button", "entit", "parse"))):
+            log.warning(f"Telegram rechazó íconos personalizados ({desc}); se reintenta con emojis normales.")
+            res = _orig_make_request(token, method_name, method, _quitar_iconos(params), files)
+            if _iconos_on[0]:
+                _iconos_on[0] = False
+                log.warning("Íconos personalizados DESACTIVADOS (tu cuenta/bot no los admite).")
+            return res
+        raise
+
+
+apihelper._make_request = _make_request_seguro
+
+
+# =====================================================================
+# 🎨 BOTONES DE COLOR (verde = disponible · rojo = sin stock/cancelar · azul = navegación/infinito)
+# =====================================================================
+VERDE, ROJO, AZUL = "success", "danger", "primary"
+_estilo_ok = [True]
+
+
+def btn(texto, cb=None, url=None, style=None, icono=None):
+    kw = {}
+    if cb is not None:
+        kw["callback_data"] = cb
+    if url is not None:
+        kw["url"] = url
+    if icono in ICONOS:
+        eid = _iconos_ids.get(icono) if _iconos_on[0] else None
+        if eid:
+            kw["icon_custom_emoji_id"] = eid
+        else:
+            texto = f"{ICONOS[icono][0]} {texto}"
+    if style and _estilo_ok[0]:
+        try:
+            return _TgButton(texto, style=style, **kw)
+        except TypeError:
+            _estilo_ok[0] = False
+            log.warning("Tu versión de pyTelegramBotAPI no soporta colores en botones; actualízala.")
+    return _TgButton(texto, **kw)
+
+
+def boton_volver_menu():
+    m = InlineKeyboardMarkup()
+    m.add(btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
+    return m
+
+
+def boton_cancelar(destino="inicio"):
+    m = InlineKeyboardMarkup()
+    m.add(btn("Cancelar", destino, style=ROJO, icono="error"))
+    return m
+
+
+def boton_admin_url():
+    return btn("Contactar al administrador", url=f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", style=AZUL, icono="soporte")
 
 
 # =====================================================================
@@ -257,21 +497,27 @@ _cat_lock = Lock()
 _ver_lock = Lock()
 
 
-def es_a_correo(producto):
-    return any(k in producto.casefold() for k in PRODUCTOS_A_CORREO)
+def tok(nombre):
+    return hashlib.sha1(nombre.encode("utf-8")).hexdigest()[:12]
 
 
 def _construir_catalogo():
     v = _cat["ver"]
-    filas = q("""SELECT c.producto, c.precio, c.descripcion, COALESCE(s.n, 0)
+    filas = q("""SELECT c.producto, c.precio, c.descripcion, c.modalidad, c.infinito, c.entrega_infinita, COALESCE(s.n, 0)
                  FROM catalogo_db c
                  LEFT JOIN (SELECT producto, COUNT(*) AS n FROM stock
                             WHERE vendido = 0 GROUP BY producto) s ON s.producto = c.producto
                  ORDER BY c.producto""")
     data = {}
-    for prod, precio, desc, n in filas:
-        data[prod] = {"precio": round(float(precio or 0), 2), "desc": desc or "",
-                      "stock": int(n), "correo": es_a_correo(prod)}
+    for prod, precio, desc, mod, inf, ent, n in filas:
+        mod = mod if mod in MODALIDADES else "email_pass"
+        manual = mod in MANUALES
+        inf = bool(inf) and not manual
+        tiene = bool((ent or "").strip())
+        disponible = True if manual else (tiene if inf else int(n) > 0)
+        data[prod] = {"precio": round(float(precio or 0), 2), "desc": desc or "", "modalidad": mod,
+                      "manual": manual, "infinito": inf, "tiene_contenido": tiene,
+                      "stock": int(n), "disponible": disponible}
     snap = (data, {tok(p): p for p in data}, time.time(), v)
     _cat["snap"] = snap
     return snap
@@ -292,7 +538,6 @@ def invalidar_cache():
 
 
 def catalogo_completo():
-    """{producto: {precio, desc, stock, correo}} — instantáneo si está en caché."""
     snap = _cat["snap"]
     if snap is None or snap[3] != _cat["ver"]:
         with _cat_lock:
@@ -307,7 +552,6 @@ def catalogo_completo():
 
 
 def resolver_token(token):
-    """Convierte el token corto del botón en el nombre real del producto."""
     catalogo_completo()
     nombre = _cat["snap"][1].get(token)
     if nombre is None:
@@ -317,8 +561,10 @@ def resolver_token(token):
     return nombre
 
 
-def tok(nombre):
-    return hashlib.sha1(nombre.encode("utf-8")).hexdigest()[:12]
+def info_fresca(producto):
+    """Información del producto leída de la base de datos (sin caché)."""
+    invalidar_cache()
+    return catalogo_completo().get(producto)
 
 
 def buscar_producto_nombre(texto_busqueda):
@@ -327,15 +573,6 @@ def buscar_producto_nombre(texto_busqueda):
         if prod.lower() == t or t in prod.lower():
             return prod
     return None
-
-
-def precio_en_vivo(producto):
-    fila = q("SELECT precio FROM catalogo_db WHERE producto = %s", (producto,), "one")
-    return round(float(fila[0]), 2) if fila else 0.0
-
-
-def stock_en_vivo(producto):
-    return q("SELECT COUNT(*) FROM stock WHERE producto = %s AND vendido = 0", (producto,), "one")[0]
 
 
 def a_dec(x):
@@ -349,7 +586,6 @@ _usuarios_vistos = {}
 
 
 def registrar_usuario(user):
-    """Guarda al usuario solo si es nuevo o cambió su nombre/username (sin consulta en cada clic)."""
     uname = (user.username or "").lower()
     nombre = user.first_name or "Usuario"
     if _usuarios_vistos.get(user.id) == (uname, nombre):
@@ -416,64 +652,33 @@ def _es_duplicado(uid, data, ventana=0.7):
 
 
 # =====================================================================
-# 🎨 BOTONES DE COLOR  (🟢 verde = bueno/stock · 🔴 rojo = sin stock/cancelar · 🔵 azul = navegación)
-# =====================================================================
-VERDE, ROJO, AZUL = "success", "danger", "primary"
-_estilo_ok = [True]
-
-
-def btn(texto, cb=None, url=None, style=None):
-    kw = {}
-    if cb is not None:
-        kw["callback_data"] = cb
-    if url is not None:
-        kw["url"] = url
-    if style and _estilo_ok[0]:
-        try:
-            return _TgButton(texto, style=style, **kw)
-        except TypeError:
-            _estilo_ok[0] = False
-            log.warning("Tu versión de pyTelegramBotAPI no soporta colores en botones; actualízala.")
-    return _TgButton(texto, **kw)
-
-
-def boton_volver_menu():
-    m = InlineKeyboardMarkup()
-    m.add(btn("🏠 Menú Principal", "inicio", style=AZUL))
-    return m
-
-
-def boton_cancelar():
-    m = InlineKeyboardMarkup()
-    m.add(btn("❌ Cancelar", "inicio", style=ROJO))
-    return m
-
-
-# =====================================================================
 # 🧰 UTILIDADES DE TELEGRAM
 # =====================================================================
 def configurar_menu_comandos():
     try:
         publicos = [
-            BotCommand("menu", "🏠 Menú Principal"),
-            BotCommand("buy", "🛒 Catálogo de Compras"),
-            BotCommand("stock", "📊 Consultar Stock"),
-            BotCommand("mis_entregas", "📦 Recuperar entrega pendiente"),
+            BotCommand("menu", "Menú principal"),
+            BotCommand("buy", "Catálogo de compras"),
+            BotCommand("stock", "Consultar stock"),
+            BotCommand("mis_entregas", "Recuperar entrega pendiente"),
         ]
         bot.set_my_commands(publicos)
         admin = publicos + [
-            BotCommand("cmds", "👑 Panel de Administración"),
-            BotCommand("cargar", "📥 Subir Stock"),
-            BotCommand("cargar_lote", "📦 Carga Masiva"),
-            BotCommand("agregar_plataforma", "➕ Agregar plataforma"),
-            BotCommand("quitar_plataforma", "🗑️ Eliminar plataforma"),
-            BotCommand("modificar_nombre", "✏️ Cambiar nombre"),
-            BotCommand("modificar_precio", "💵 Cambiar precio"),
-            BotCommand("modificar_descripcion", "📌 Cambiar descripción"),
-            BotCommand("noti", "📢 Anuncio Global"),
-            BotCommand("stats", "📈 Estadísticas"),
-            BotCommand("testbinance", "🧪 Probar conexión Binance"),
-            BotCommand("testip", "🌐 Ver IP de Railway"),
+            BotCommand("cmds", "Panel de administración"),
+            BotCommand("agregar_plataforma", "Agregar plataforma"),
+            BotCommand("quitar_plataforma", "Eliminar plataforma"),
+            BotCommand("modificar_nombre", "Cambiar nombre"),
+            BotCommand("modificar_precio", "Cambiar precio"),
+            BotCommand("modificar_descripcion", "Cambiar información"),
+            BotCommand("modificar_modalidad", "Cambiar modalidad"),
+            BotCommand("modificar_stock", "Stock infinito o normal"),
+            BotCommand("cargar", "Subir stock"),
+            BotCommand("cargar_lote", "Carga masiva"),
+            BotCommand("noti", "Anuncio global"),
+            BotCommand("stats", "Estadísticas"),
+            BotCommand("iconos", "Íconos personalizados"),
+            BotCommand("testbinance", "Probar Binance"),
+            BotCommand("testip", "IP de Railway"),
         ]
         bot.set_my_commands(admin, scope=BotCommandScopeChat(ADMIN_ID))
     except Exception as e:
@@ -488,7 +693,6 @@ def _responder(call, texto=None, alerta=False):
 
 
 def _responder_async(call, texto=None, alerta=False):
-    """Quita el 'relojito' del botón en paralelo, sin retrasar la respuesta real."""
     Thread(target=_responder, args=(call, texto, alerta), daemon=True).start()
 
 
@@ -516,7 +720,6 @@ def editar(msg, texto, markup=None):
 
 
 def editar_o_enviar(chat_id, msg_id, texto, markup=None):
-    """Intenta editar; si falla, envía un mensaje nuevo. Devuelve True si el usuario lo recibió."""
     try:
         bot.edit_message_text(texto, chat_id, msg_id, reply_markup=markup)
         return True
@@ -537,9 +740,9 @@ def enviar_archivo_txt(chat_id, contenido, nombre_archivo, caption=""):
     bot.send_document(chat_id, archivo, caption=caption, reply_markup=boton_volver_menu())
 
 
-def avisar_admin(texto):
+def avisar_admin(texto, markup=None):
     try:
-        bot.send_message(ADMIN_ID, texto)
+        bot.send_message(ADMIN_ID, texto, reply_markup=markup)
     except Exception as e:
         log.error(f"No se pudo avisar al admin: {e}")
 
@@ -547,16 +750,11 @@ def avisar_admin(texto):
 # =====================================================================
 # 💎 VERIFICACIÓN DE PAGOS EN BINANCE
 # =====================================================================
-# El pago normal por Binance Pay (el "ID de orden" de la app) se consulta en el
-# historial de TU cuenta: GET /sapi/v1/pay/transactions
-# La API Key debe ser una API normal de Binance con permiso "Enable Reading".
-# =====================================================================
 _binance_lock = Lock()
 _binance_last = [0.0]
 
 
 def _binance_get(path, params):
-    # Se serializan las consultas con una pausa mínima para no exceder el límite de Binance.
     with _binance_lock:
         espera = 0.4 - (time.time() - _binance_last[0])
         if espera > 0:
@@ -587,8 +785,7 @@ def _coincide_id(tx, order_id):
 
 
 def verificar_pago_binance(order_id, monto_esperado, creado_ms=None):
-    """Comprueba una transferencia recibida en el historial autenticado de Binance.
-    Retorna (True, monto_float) o (False, mensaje)."""
+    """Comprueba una transferencia recibida en el historial de Binance. -> (True, monto) | (False, mensaje)"""
     order_id = str(order_id).strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", order_id):
         return False, "Identificador de operación inválido."
@@ -607,10 +804,8 @@ def verificar_pago_binance(order_id, monto_esperado, creado_ms=None):
     encontrado = None
     try:
         for _ in range(4):
-            status, data = _binance_get(
-                "/sapi/v1/pay/transactions",
-                {"startTimestamp": inicio, "endTimestamp": fin, "limit": 100},
-            )
+            status, data = _binance_get("/sapi/v1/pay/transactions",
+                                        {"startTimestamp": inicio, "endTimestamp": fin, "limit": 100})
             if status != 200 or not isinstance(data, dict) or str(data.get("code", "000000")) not in ("000000", "0"):
                 log.error(f"Binance status={status} resp={str(data)[:300]}")
                 return False, "No se pudo consultar el historial de pagos. Inténtalo de nuevo en unos segundos."
@@ -635,8 +830,7 @@ def verificar_pago_binance(order_id, monto_esperado, creado_ms=None):
         return False, ("No se encontró ese ID en el historial. Comprueba el comprobante; "
                        "si pagaste hace segundos, espera 1 minuto y reintenta.")
     try:
-        moneda = str(encontrado.get("currency", "")).upper()
-        if moneda != "USDT":
+        if str(encontrado.get("currency", "")).upper() != "USDT":
             return False, "La transacción no corresponde a USDT."
         monto = Decimal(str(encontrado.get("amount", "")))
         if not monto.is_finite() or monto <= 0:
@@ -663,47 +857,81 @@ def verificar_pago_binance(order_id, monto_esperado, creado_ms=None):
 # =====================================================================
 # 🖼️ VISTAS
 # =====================================================================
+def formatear_descripcion(txt):
+    """'+ ' = ✅, '- ' = ❌, '**negrita**'. Todo lo demás se escapa (seguro para HTML)."""
+    salida = []
+    for linea in (txt or "").split("\n"):
+        linea = linea.rstrip()
+        if not linea.strip():
+            salida.append("")
+            continue
+        pref = ""
+        if linea.startswith("+ "):
+            pref, linea = ic("ok") + " ", linea[2:]
+        elif linea.startswith("- "):
+            pref, linea = ic("error") + " ", linea[2:]
+        cuerpo = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(linea))
+        salida.append(pref + cuerpo)
+    return "\n".join(salida).strip()
+
+
+def etiqueta_estado(info):
+    """Texto corto con el estado de stock (para /stock)."""
+    mod = info["modalidad"]
+    if mod == "correo":
+        return f"{ic('correo')} A correo"
+    if mod == "dominio":
+        return f"{ic('dominio')} A dominio"
+    if info["infinito"]:
+        return f"{ic('infinito')} Ilimitado" if info["tiene_contenido"] else "🔴 Sin contenido cargado"
+    n = info["stock"]
+    return f"{'🟢' if n > 0 else '🔴'} {n} disp."
+
+
 def vista_menu_principal(user):
     uname = f"@{user.username}" if user.username else "Sin @username"
     nombre = user.first_name or "Cliente"
     es_admin = user.id == ADMIN_ID
-    rango = "👑 ADMINISTRADOR" if es_admin else "👤 Cliente"
+    rango = "Administrador" if es_admin else "Cliente"
     texto = (
-        "⚡ <b>SA SHOP — TIENDA AUTOMÁTICA 24/7</b> ⚡\n\n"
-        f"┏ 👤 <b>Usuario:</b> {esc(nombre)} (<code>{esc(uname)}</code>)\n"
-        f"┣ 🎖️ <b>Rol:</b> {rango}\n"
-        f"┗ 🆔 <b>ID:</b> <code>{user.id}</code>\n\n"
-        "👇 Selecciona una opción:"
+        f"{ic('rayo')} <b>SA SHOP — TIENDA AUTOMÁTICA 24/7</b>\n\n"
+        f"{ic('perfil')} <b>Usuario:</b> {esc(nombre)} (<code>{esc(uname)}</code>)\n"
+        f"{ic('admin') if es_admin else ic('ok')} <b>Rol:</b> {rango}\n"
+        f"{ic('info')} <b>ID:</b> <code>{user.id}</code>\n\n"
+        "Selecciona una opción:"
     )
     m = InlineKeyboardMarkup(row_width=1)
     m.add(
-        btn("🛒 Ver Catálogo y Comprar", "catalogo", style=VERDE),
-        btn("👤 Mi Perfil e Historial", "perfil", style=AZUL),
-        btn("🛠️ Soporte y Ayuda", "soporte", style=AZUL),
+        btn("Ver Catálogo y Comprar", "catalogo", style=VERDE, icono="tienda"),
+        btn("Mi Perfil e Historial", "perfil", style=AZUL, icono="perfil"),
+        btn("Soporte y Ayuda", "soporte", style=AZUL, icono="soporte"),
     )
     if es_admin:
-        m.add(btn("👑 Panel de Administración", "panel_admin", style=AZUL))
+        m.add(btn("Panel de Administración", "panel_admin", style=AZUL, icono="admin"))
     return texto, m
 
 
 def vista_catalogo(aviso=""):
     m = InlineKeyboardMarkup(row_width=1)
     for prod, info in catalogo_completo().items():
-        precio = info["precio"]
-        if info["correo"]:
-            txt, ok = f"🟢 {prod} | ${precio:.2f} | ✉️ A correo", True
-        elif info["stock"] > 0:
-            txt, ok = f"🟢 {prod} | ${precio:.2f} | 📦 {info['stock']}", True
+        precio, mod = info["precio"], info["modalidad"]
+        if mod == "correo":
+            txt, ico, est = f"{prod} | ${precio:.2f} | A correo", "correo", VERDE
+        elif mod == "dominio":
+            txt, ico, est = f"{prod} | ${precio:.2f} | A dominio", "dominio", VERDE
+        elif info["infinito"] and info["tiene_contenido"]:
+            txt, ico, est = f"{prod} | ${precio:.2f} | Ilimitado", "infinito", AZUL
+        elif info["disponible"]:
+            txt, ico, est = f"{prod} | ${precio:.2f} | {info['stock']}", "stock", VERDE
         else:
-            txt, ok = f"🔴 {prod} | ${precio:.2f} | ❌ Sin stock", False
-        m.add(btn(txt, f"sel:{tok(prod)}", style=VERDE if ok else ROJO))
-    m.add(btn("🏠 Menú Principal", "inicio", style=AZUL))
+            txt, ico, est = f"{prod} | ${precio:.2f} | Sin stock", "error", ROJO
+        m.add(btn(txt, f"sel:{tok(prod)}", style=est, icono=ico))
+    m.add(btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
     texto = (
         f"{aviso}"
-        "🛒 <b>CATÁLOGO DE PRODUCTOS</b>\n\n"
-        "🟢 Disponible  |  🔴 Sin stock\n"
-        "📦 Unidades en stock  |  ✉️ Activación a correo\n\n"
-        "👇 Selecciona el producto que deseas comprar:"
+        f"{ic('tienda')} <b>CATÁLOGO DE PRODUCTOS</b>\n\n"
+        "🟢 Disponible   🔴 Sin stock   🔵 Stock ilimitado\n\n"
+        "Selecciona el producto que deseas comprar:"
     )
     return texto, m
 
@@ -711,91 +939,133 @@ def vista_catalogo(aviso=""):
 def vista_sin_stock(producto):
     texto = (
         "🔴 <b>SIN STOCK</b>\n\n"
-        f"😔 Por ahora <b>{esc(producto)}</b> no tiene unidades disponibles.\n\n"
-        "🔄 Estamos reponiendo el inventario, vuelve a consultar en un rato.\n"
-        "💬 Si lo necesitas con urgencia, escríbele al administrador."
+        f"Por ahora <b>{esc(producto)}</b> no tiene unidades disponibles.\n\n"
+        "Estamos reponiendo el inventario, vuelve a consultar en un rato.\n"
+        "Si lo necesitas con urgencia, escríbele al administrador."
     )
     m = InlineKeyboardMarkup(row_width=1)
-    m.add(
-        btn("⬅️ Volver al Catálogo", "catalogo", style=AZUL),
-        btn("💬 Contactar al Administrador", url=f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", style=AZUL),
-        btn("🏠 Menú Principal", "inicio", style=AZUL),
-    )
+    m.add(btn("Volver al Catálogo", "catalogo", style=AZUL, icono="volver"),
+          boton_admin_url(),
+          btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
     return texto, m
 
 
-def menu_cantidad(producto, cantidad, precio_unit, stock):
-    total = round(cantidad * precio_unit, 2)
-    texto = (
-        "📦 <b>SELECCIONA LA CANTIDAD</b>\n\n"
-        f"• Producto: <code>{esc(producto)}</code>\n"
-        f"• Stock disponible: <code>{stock}</code>\n"
-        f"• Precio unitario: <code>{precio_unit:.2f} USDT</code>\n\n"
-        f"🔢 Cantidad: <b>{cantidad}</b>\n"
-        f"💵 <b>Total a pagar:</b> <code>{total:.2f} USDT</code>"
-    )
-    t = tok(producto)
+def vista_producto(nombre, info, cantidad=1):
+    """Pantalla de la plataforma: información + cantidad + pagar."""
+    mod = info["modalidad"]
+    precio = info["precio"]
+    if mod == "correo":
+        entrega, linea_stock = "Activación manual a tu correo", f"{ic('correo')} <b>Modalidad:</b> A correo"
+    elif mod == "dominio":
+        entrega, linea_stock = "Entrega manual con el administrador", f"{ic('dominio')} <b>Modalidad:</b> A dominio"
+    else:
+        entrega = "Entrega automática instantánea"
+        linea_stock = (f"{ic('infinito')} <b>Stock:</b> ilimitado" if info["infinito"]
+                       else f"{ic('stock')} <b>Stock disponible:</b> {info['stock']}")
+    partes = [
+        f"{ic('tienda')} <b>{esc(nombre)}</b>\n",
+        f"{ic('ok')} <b>Producto oficial de la tienda</b>",
+        f"{ic('rayo')} {entrega}\n",
+        f"<blockquote>{ic('info')} <b>Descripción</b>\n{formatear_descripcion(info['desc'])}</blockquote>\n",
+        f"{ic('pagar')} <b>Precio:</b> <code>{precio:.2f} USDT</code>",
+        linea_stock,
+    ]
     m = InlineKeyboardMarkup(row_width=3)
-    m.add(
-        btn("➖ Quitar", f"cant:menos:{t}", style=ROJO),
-        btn(f"🔢 {cantidad}", "nada"),
-        btn("➕ Agregar", f"cant:mas:{t}", style=VERDE),
-    )
-    m.add(btn(f"💳 Pagar {total:.2f} USDT con Binance Pay", f"cant:ok:{t}", style=VERDE))
-    m.add(btn("⬅️ Volver al Catálogo", "catalogo", style=AZUL))
-    return texto, m
+    t = tok(nombre)
+    if not info["manual"]:
+        total = round(cantidad * precio, 2)
+        partes.append(f"<b>Cantidad:</b> {cantidad}   ·   <b>Total:</b> <code>{total:.2f} USDT</code>")
+        m.row(btn("Quitar", f"cant:menos:{t}", style=ROJO, icono="menos"),
+              btn(str(cantidad), "nada"),
+              btn("Agregar", f"cant:mas:{t}", style=VERDE, icono="mas"))
+    else:
+        total = precio
+    if mod == "dominio":
+        partes.append("\n<i>Tras pagar deberás contactar directamente con el administrador para coordinar la entrega.</i>")
+    else:
+        partes.append("\n<i>Entrega después de la confirmación del pago.</i>")
+    m.row(btn(f"Pagar con Binance · {total:.2f} USDT", f"pagar:{t}", style=VERDE, icono="pagar"))
+    if mod == "dominio":
+        m.row(boton_admin_url())
+    m.row(btn("Volver al Catálogo", "catalogo", style=AZUL, icono="volver"))
+    return "\n".join(partes), m
 
 
-def texto_instrucciones_pago(producto, cantidad, total, correo=None):
-    extra = f"📧 Correo: <code>{esc(correo)}</code>\n" if correo else ""
+def texto_instrucciones_pago(producto, cantidad, total, extra=""):
     return (
-        "💎 <b>PAGO DIRECTO CON BINANCE PAY</b> 💎\n\n"
-        f"📦 <b>Producto:</b> {esc(producto)} (x{cantidad})\n{extra}\n"
-        "📌 <b>DETALLES DE PAGO:</b>\n"
-        "• <b>MÉTODO:</b> Binance Pay\n"
-        f"• <b>MONTO:</b> <code>{total:.2f} USDT</code>\n"
-        f"• <b>ID DE BINANCE PAY:</b> <code>{esc(BINANCE_PAY_ID)}</code>\n"
-        f"• <b>TITULAR:</b> {esc(TITULAR)}\n\n"
-        "📸 Escanea el QR o transfiere al ID indicado.\n\n"
-        "👇 Luego pega aquí el <b>ID de orden</b> de tu pago para validarlo y recibir tu entrega automática."
+        f"{ic('pagar')} <b>PAGO CON BINANCE PAY</b>\n\n"
+        f"{ic('tienda')} <b>Producto:</b> {esc(producto)} (x{cantidad})\n{extra}\n"
+        "<b>DETALLES DE PAGO</b>\n"
+        "• <b>Método:</b> Binance Pay\n"
+        f"• <b>Monto:</b> <code>{total:.2f} USDT</code>\n"
+        f"• <b>ID de Binance Pay:</b> <code>{esc(BINANCE_PAY_ID)}</code>\n"
+        f"• <b>Titular:</b> {esc(TITULAR)}\n\n"
+        "1. Escanea el QR o transfiere al ID indicado.\n"
+        "2. Pulsa <b>Ya pagué</b> y envía tu <b>ID de orden</b> para verificar el pago."
     )
 
 
-def enviar_pago(chat_id, texto):
-    m = InlineKeyboardMarkup()
-    m.add(btn("❌ Cancelar", "catalogo", style=ROJO))
+def teclado_pago():
+    m = InlineKeyboardMarkup(row_width=1)
+    m.add(btn("Ya pagué", "yp", style=VERDE, icono="ok"),
+          btn("Cancelar", "catalogo", style=ROJO, icono="error"))
+    return m
+
+
+def mostrar_pago(chat_id, st, texto_extra=""):
+    st["paso"] = "pago"
+    st["creado_ms"] = int(time.time() * 1000)
+    texto = texto_instrucciones_pago(st["producto"], st.get("cantidad", 1), st["total"], texto_extra)
     try:
-        bot.send_photo(chat_id, QR_URL, caption=texto, reply_markup=m)
+        bot.send_photo(chat_id, QR_URL, caption=texto, reply_markup=teclado_pago())
     except Exception:
-        bot.send_message(chat_id, texto, reply_markup=m)
+        bot.send_message(chat_id, texto, reply_markup=teclado_pago())
 
 
-TEXTO_CMDS_ADMIN = (
-    "👑 <b>PANEL DE CONTROL ADMIN</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "📦 <b>CATÁLOGO Y STOCK</b>\n"
-    "• /agregar_plataforma ➔ Crear producto\n"
-    "• /quitar_plataforma ➔ Eliminar producto\n"
-    "• /modificar_nombre ➔ Cambiar nombre\n"
-    "• /modificar_precio ➔ Cambiar precio\n"
-    "• /modificar_descripcion ➔ Cambiar descripción\n"
-    "• /cargar ➔ Subir cuentas\n"
-    "• /cargar_lote ➔ Carga masiva\n"
-    "• /stock ➔ Reporte + TXT general\n"
-    "• <code>/borrar [ID]</code> ➔ Eliminar cuenta\n"
-    "• <code>/vaciar [nombre]</code> ➔ Limpiar stock no vendido\n\n"
-    "📢 <b>COMUNICACIÓN</b>\n"
-    "• /noti ➔ Anuncio global\n"
-    "• <code>/enviar [ID/@user]</code> ➔ Mensaje privado\n\n"
-    "👥 <b>CLIENTES Y FINANZAS</b>\n"
-    "• <code>/historial [ID/@user]</code> ➔ Compras del cliente\n"
-    "• /stats ➔ Métricas de la tienda\n"
-    "• /usuarios ➔ Base de clientes en TXT\n\n"
-    "🧪 <b>DIAGNÓSTICO</b>\n"
-    "• /testbinance ➔ Probar conexión con Binance\n"
-    "• /testip ➔ Ver IP pública de Railway\n"
-    "• /mis_entregas ➔ Recuperar entrega pendiente"
-)
+def texto_pedir_id():
+    return (
+        f"{ic('pagar')} <b>VERIFICAR PAGO</b>\n\n"
+        "Envía aquí el <b>ID de orden</b> de tu pago de Binance.\n"
+        "<i>Lo encuentras en el comprobante, en la línea «ID de orden».</i>\n\n"
+        "<b>Ejemplo:</b> <code>463440249244098560</code>"
+    )
+
+
+def texto_cmds_admin():
+    return (
+        f"{ic('admin')} <b>PANEL DE ADMINISTRACIÓN</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>🗂 CATÁLOGO</b>\n"
+        "/agregar_plataforma ➔ Crear una plataforma\n"
+        "/quitar_plataforma ➔ Eliminar una plataforma\n"
+        "/modificar_nombre ➔ Cambiar el nombre\n"
+        "/modificar_precio ➔ Cambiar el precio\n"
+        "/modificar_descripcion ➔ Cambiar la información\n"
+        "/modificar_modalidad ➔ Cambiar la modalidad de entrega\n"
+        "/modificar_stock ➔ Stock infinito o normal\n\n"
+        "<b>📦 INVENTARIO</b>\n"
+        "/cargar ➔ Subir cuentas o links (formato validado)\n"
+        "/cargar_lote ➔ Carga masiva (30 a 1000+)\n"
+        "/stock ➔ Ver inventario y descargar TXT\n"
+        "/borrar [ID] ➔ Eliminar una cuenta\n"
+        "/vaciar [nombre] ➔ Vaciar el stock no vendido\n\n"
+        "<b>📢 COMUNICACIÓN</b>\n"
+        "/noti ➔ Anuncio global a todos los clientes\n"
+        "/enviar [ID/@user] ➔ Mensaje privado a un cliente\n\n"
+        "<b>👥 CLIENTES Y FINANZAS</b>\n"
+        "/historial [ID/@user] ➔ Compras de un cliente\n"
+        "/stats ➔ Métricas y finanzas de la tienda\n"
+        "/usuarios ➔ Lista de clientes en TXT\n\n"
+        "<b>⚙️ SISTEMA</b>\n"
+        "/iconos ➔ Íconos personalizados (emojis premium)\n"
+        "/testbinance ➔ Probar la conexión con Binance\n"
+        "/testip ➔ Ver la IP pública de Railway\n"
+        "/mis_entregas ➔ Recuperar una entrega pendiente\n\n"
+        "<b>🛒 COMANDOS DE CLIENTES</b>\n"
+        "/menu ➔ Menú principal\n"
+        "/buy ➔ Catálogo de compras\n"
+        "/stock ➔ Consultar stock"
+    )
 
 
 # =====================================================================
@@ -825,26 +1095,27 @@ def cmd_stock(message):
     catalogo = catalogo_completo()
 
     if len(partes) == 1:
-        lineas = ["📊 <b>ESTADO DEL INVENTARIO</b>\n"]
+        lineas = [f"{ic('stock')} <b>ESTADO DEL INVENTARIO</b>\n"]
         for prod, info in catalogo.items():
-            if info["correo"]:
-                lineas.append(f"🟢 <b>{esc(prod)}</b> ➔ <code>{info['precio']:.2f} USDT</code> | ✉️ {esc(info['desc'])}")
-            else:
-                cant = info["stock"]
-                color = "🟢" if cant > 0 else "🔴"
-                lineas.append(f"{color} <b>{esc(prod)}</b> ➔ <code>{cant}</code> disp. (<code>{info['precio']:.2f} USDT</code>) | 📌 {esc(info['desc'])}")
+            lineas.append(f"{etiqueta_estado(info)} · <b>{esc(prod)}</b> · <code>{info['precio']:.2f} USDT</code> · {MOD_CORTO[info['modalidad']]}")
         bot.reply_to(message, "\n".join(lineas), reply_markup=boton_volver_menu())
 
         if es_admin:
             filas = q("SELECT id, producto, credenciales FROM stock WHERE vendido = 0 ORDER BY producto, id")
-            if filas:
-                txt = ["=== REPORTE GENERAL DE STOCK DISPONIBLE ===", ""]
-                actual = ""
-                for sid, prod, cred in filas:
-                    if prod != actual:
-                        actual = prod
-                        txt.append(f"\n--- [{prod.upper()}] ---")
-                    txt.append(f"ID: {sid} | {cred}")
+            txt = ["=== REPORTE GENERAL DE STOCK DISPONIBLE ===", ""]
+            for prod, info in catalogo.items():
+                if info["infinito"]:
+                    ent = q("SELECT entrega_infinita FROM catalogo_db WHERE producto = %s", (prod,), "one")
+                    txt.append(f"\n--- [{prod.upper()}] (STOCK INFINITO) ---\nSe entrega a todos: {(ent[0] if ent else '') or '(sin contenido)'}")
+            actual = ""
+            for sid, prod, cred in filas:
+                if catalogo.get(prod, {}).get("infinito"):
+                    continue
+                if prod != actual:
+                    actual = prod
+                    txt.append(f"\n--- [{prod.upper()}] ---")
+                txt.append(f"ID: {sid} | {cred}")
+            if len(txt) > 2:
                 enviar_archivo_txt(message.chat.id, "\n".join(txt), "stock_general.txt", "🔐 <b>Cuentas en inventario</b>")
         return
 
@@ -852,36 +1123,32 @@ def cmd_stock(message):
     if not prod:
         bot.reply_to(message, f"❌ No se encontró <code>{esc(partes[1])}</code> en el catálogo.", reply_markup=boton_volver_menu())
         return
-
     info = catalogo[prod]
-    if info["correo"]:
-        bot.reply_to(message, f"📦 <b>{esc(prod)}</b>\n💵 Precio: <code>{info['precio']:.2f} USDT</code>\n📌 {esc(info['desc'])}", reply_markup=boton_volver_menu())
-        return
-
-    cant = info["stock"]
-    color = "🟢" if cant > 0 else "🔴"
     bot.reply_to(
         message,
-        f"📦 <b>Inventario:</b> {esc(prod)}\n💵 <b>Precio:</b> <code>{info['precio']:.2f} USDT</code>\n"
-        f"📌 <b>Tipo:</b> {esc(info['desc'])}\n{color} <b>Disponibles:</b> <code>{cant}</code>",
-        reply_markup=boton_volver_menu(),
-    )
-    if es_admin and cant > 0:
-        filas = q("SELECT id, credenciales FROM stock WHERE producto = %s AND vendido = 0 ORDER BY id", (prod,))
-        contenido = f"=== STOCK DE {prod.upper()} ({len(filas)}) ===\n\n" + "\n".join(f"ID: {f[0]} | {f[1]}" for f in filas)
-        enviar_archivo_txt(message.chat.id, contenido, f"stock_{prod.lower().replace(' ', '_')}.txt", f"🔐 <b>Credenciales de {esc(prod)}</b>")
+        f"{ic('stock')} <b>Inventario:</b> {esc(prod)}\n<b>Precio:</b> <code>{info['precio']:.2f} USDT</code>\n"
+        f"<b>Modalidad:</b> {MODALIDADES[info['modalidad']]}\n<b>Estado:</b> {etiqueta_estado(info)}",
+        reply_markup=boton_volver_menu())
+    if es_admin and not info["manual"]:
+        if info["infinito"]:
+            ent = q("SELECT entrega_infinita FROM catalogo_db WHERE producto = %s", (prod,), "one")
+            contenido = f"=== {prod.upper()} (STOCK INFINITO) ===\n\nSe entrega a todos:\n{(ent[0] if ent else '') or '(sin contenido)'}"
+            enviar_archivo_txt(message.chat.id, contenido, "stock_infinito.txt", f"🔐 <b>Contenido de {esc(prod)}</b>")
+        elif info["stock"] > 0:
+            filas = q("SELECT id, credenciales FROM stock WHERE producto = %s AND vendido = 0 ORDER BY id", (prod,))
+            contenido = f"=== STOCK DE {prod.upper()} ({len(filas)}) ===\n\n" + "\n".join(f"ID: {f[0]} | {f[1]}" for f in filas)
+            enviar_archivo_txt(message.chat.id, contenido, f"stock_{prod.lower().replace(' ', '_')}.txt", f"🔐 <b>Credenciales de {esc(prod)}</b>")
 
 
 @bot.message_handler(commands=["mis_entregas"])
 def cmd_mis_entregas(message):
-    """Reenvía entregas que quedaron pendientes tras un error de Telegram."""
     uid = message.from_user.id
     pendientes = q("SELECT order_id, producto, credenciales FROM entregas_pendientes WHERE user_id = %s ORDER BY creado LIMIT 10", (uid,))
     if not pendientes:
-        bot.reply_to(message, "📦 No tienes entregas pendientes. Consulta /menu para ver tu historial.", reply_markup=boton_volver_menu())
+        bot.reply_to(message, "No tienes entregas pendientes. Consulta /menu para ver tu historial.", reply_markup=boton_volver_menu())
         return
     for oid, prod, cred in pendientes:
-        bot.send_message(message.chat.id, f"📦 <b>Entrega recuperada</b>\nProducto: {esc(prod)}\nAccesos: <code>{esc(cred)}</code>")
+        bot.send_message(message.chat.id, f"{ic('stock')} <b>Entrega recuperada</b>\nProducto: {esc(prod)}\nAccesos: <code>{esc(cred)}</code>")
         q("DELETE FROM entregas_pendientes WHERE order_id = %s AND user_id = %s", (oid, uid), fetch=None)
 
 
@@ -895,7 +1162,7 @@ def solo_admin(message):
 @bot.message_handler(commands=["cmds", "admin", "ayuda"])
 def cmd_cmds(message):
     if solo_admin(message):
-        bot.reply_to(message, TEXTO_CMDS_ADMIN, reply_markup=boton_volver_menu())
+        bot.reply_to(message, texto_cmds_admin(), reply_markup=boton_volver_menu())
 
 
 @bot.message_handler(commands=["testip"])
@@ -917,16 +1184,13 @@ def cmd_testbinance(message):
     msg = bot.reply_to(message, "🧪 Probando conexión con Binance...")
     try:
         ahora = int(time.time() * 1000)
-        status, data = _binance_get(
-            "/sapi/v1/pay/transactions",
-            {"startTimestamp": ahora - 7 * 24 * 3600 * 1000, "endTimestamp": ahora, "limit": 10},
-        )
+        status, data = _binance_get("/sapi/v1/pay/transactions",
+                                    {"startTimestamp": ahora - 7 * 24 * 3600 * 1000, "endTimestamp": ahora, "limit": 10})
         if status == 200 and str(data.get("code", "000000")) in ("000000", "0"):
             lista = data.get("data") or []
             resumen = "\n".join(
                 f"• <code>{esc(t.get('transactionId'))}</code> | {esc(t.get('amount'))} {esc(t.get('currency'))} | {esc(t.get('orderType'))}"
-                for t in lista[:5]
-            ) or "(sin movimientos en los últimos 7 días)"
+                for t in lista[:5]) or "(sin movimientos en los últimos 7 días)"
             texto = f"✅ <b>Conexión con Binance OK</b>\n\nÚltimas transacciones detectadas ({len(lista)}):\n{resumen}"
         else:
             texto = f"❌ <b>Error de Binance</b>\nHTTP: <code>{status}</code>\n<code>{esc(str(data)[:500])}</code>"
@@ -935,46 +1199,100 @@ def cmd_testbinance(message):
     editar_o_enviar(message.chat.id, msg.message_id, texto, boton_volver_menu())
 
 
+# ---------------------------------------------------------------------
+# ➕ Agregar plataforma
+# ---------------------------------------------------------------------
+TEXTO_MODALIDADES = (
+    "<b>Modalidad de entrega</b>\n\n"
+    "• <b>Email:Pass</b> — subes cuentas <code>correo@dominio.com:contraseña</code> y el bot las entrega.\n"
+    "• <b>Link de activación</b> — subes links <code>https://...</code> y el bot los entrega.\n"
+    "• <b>A correo</b> — el cliente deja su correo; tú envías la invitación y lo avisas con <i>Responder</i>.\n"
+    "• <b>A dominio</b> — el cliente deja su usuario de Telegram; coordinas la entrega manual con él.\n\n"
+    "👇 Elige la modalidad:"
+)
+
+TEXTO_SINTAXIS_DESC = (
+    "Escribe la <b>descripción</b> (información de la plataforma que verá el cliente).\n\n"
+    "<b>Formato:</b>\n"
+    "• Línea que empieza con <code>+</code> ➔ ✅\n"
+    "• Línea que empieza con <code>-</code> ➔ ❌\n"
+    "• <code>**texto**</code> ➔ <b>negrita</b>\n\n"
+    "<b>Ejemplo:</b>\n"
+    "<code>**Surfshark VPN** — cuenta 60 días\n"
+    "**Dispositivos:** 10\n"
+    "+ Email y Password listos para usar\n"
+    "+ Entrega inmediata tras el pago\n"
+    "- Sin garantía después de la entrega</code>"
+)
+
+
+def teclado_modalidades(cb_fn):
+    m = InlineKeyboardMarkup(row_width=1)
+    for clave, nombre in MODALIDADES.items():
+        m.add(btn(nombre, cb_fn(clave), style=AZUL, icono=ICONO_MOD[clave]))
+    m.add(btn("Cancelar", "inicio", style=ROJO, icono="error"))
+    return m
+
+
 @bot.message_handler(commands=["agregar_plataforma"])
 def cmd_agregar_plataforma(message):
     if not solo_admin(message):
         return
     set_estado(ADMIN_ID, "agregar", paso="nombre")
-    bot.reply_to(message, "➕ <b>CREAR NUEVA PLATAFORMA</b>\n\nPaso 1/3: Envía el <b>nombre</b> (Ej: <code>Paramount+</code>):", reply_markup=boton_cancelar())
+    bot.reply_to(message, f"{ic('mas')} <b>CREAR NUEVA PLATAFORMA</b>\n\n<b>Paso 1/5 · Nombre</b>\nEnvía el nombre (Ej: <code>Paramount+ 1 Mes</code>):",
+                 reply_markup=boton_cancelar())
 
 
-def _menu_catalogo_admin(message, prefijo, icono, titulo, estilo, con_precio=False, con_desc=False):
+# ---------------------------------------------------------------------
+# Menús de selección de plataforma (modificar / quitar)
+# ---------------------------------------------------------------------
+def _menu_catalogo_admin(message, prefijo, icono, titulo, estilo, extra_fn=None):
     limpiar_estados_usuario(ADMIN_ID)
     m = InlineKeyboardMarkup(row_width=1)
     for prod, info in catalogo_completo().items():
-        extra = f" ({info['precio']:.2f} USDT)" if con_precio else (f" ({info['desc']})" if con_desc else "")
-        m.add(btn(f"{icono} {prod}{extra}", f"{prefijo}:{tok(prod)}", style=estilo))
-    m.add(btn("🏠 Menú Principal", "inicio", style=AZUL))
+        extra = f" ({extra_fn(info)})" if extra_fn else ""
+        m.add(btn(f"{prod}{extra}", f"{prefijo}:{tok(prod)}", style=estilo, icono=icono))
+    m.add(btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
     bot.reply_to(message, titulo, reply_markup=m)
 
 
 @bot.message_handler(commands=["quitar_plataforma"])
 def cmd_quitar(message):
     if solo_admin(message):
-        _menu_catalogo_admin(message, "delplat", "🗑️", "🗑️ <b>ELIMINAR PLATAFORMA</b>\n\nSelecciona el producto a retirar:", ROJO)
+        _menu_catalogo_admin(message, "delplat", "error", "🗑️ <b>ELIMINAR PLATAFORMA</b>\n\nSelecciona la plataforma a retirar:", ROJO)
 
 
 @bot.message_handler(commands=["modificar_nombre"])
 def cmd_mod_nombre(message):
     if solo_admin(message):
-        _menu_catalogo_admin(message, "modnom", "✏️", "✏️ <b>MODIFICAR NOMBRE</b>\n\nSelecciona el producto:", AZUL)
+        _menu_catalogo_admin(message, "modnom", "info", "✏️ <b>MODIFICAR NOMBRE</b>\n\nSelecciona la plataforma:", AZUL)
 
 
 @bot.message_handler(commands=["modificar_precio"])
 def cmd_mod_precio(message):
     if solo_admin(message):
-        _menu_catalogo_admin(message, "prec", "💵", "💵 <b>MODIFICAR PRECIO</b>\n\nSelecciona el producto:", AZUL, con_precio=True)
+        _menu_catalogo_admin(message, "prec", "pagar", "💵 <b>MODIFICAR PRECIO</b>\n\nSelecciona la plataforma:", AZUL,
+                             lambda i: f"{i['precio']:.2f} USDT")
 
 
 @bot.message_handler(commands=["modificar_descripcion"])
 def cmd_mod_desc(message):
     if solo_admin(message):
-        _menu_catalogo_admin(message, "moddesc", "📌", "📌 <b>MODIFICAR DESCRIPCIÓN</b>\n\nSelecciona el producto:", AZUL, con_desc=True)
+        _menu_catalogo_admin(message, "moddesc", "info", "📌 <b>MODIFICAR DESCRIPCIÓN</b>\n\nSelecciona la plataforma (es la información que ve el cliente al comprar):", AZUL)
+
+
+@bot.message_handler(commands=["modificar_modalidad"])
+def cmd_mod_modalidad(message):
+    if solo_admin(message):
+        _menu_catalogo_admin(message, "mm", "link", "🔁 <b>MODIFICAR MODALIDAD</b>\n\nSelecciona la plataforma:", AZUL,
+                             lambda i: MOD_CORTO[i["modalidad"]])
+
+
+@bot.message_handler(commands=["modificar_stock"])
+def cmd_mod_stock(message):
+    if solo_admin(message):
+        _menu_catalogo_admin(message, "ms", "infinito", "♾️ <b>MODIFICAR STOCK</b>\n\nSelecciona la plataforma:", AZUL,
+                             lambda i: ("infinito" if i["infinito"] else MOD_CORTO[i["modalidad"]] if i["manual"] else f"{i['stock']} disp."))
 
 
 def _menu_carga(message, prefijo, titulo):
@@ -982,27 +1300,31 @@ def _menu_carga(message, prefijo, titulo):
     m = InlineKeyboardMarkup(row_width=2)
     botones = []
     for prod, info in catalogo_completo().items():
-        if info["correo"]:
+        if info["manual"]:
             continue
-        cant = info["stock"]
-        botones.append(btn(f"{'🟢' if cant > 0 else '🔴'} {prod} ({cant})", f"{prefijo}:{tok(prod)}",
-                           style=VERDE if cant > 0 else ROJO))
+        if info["infinito"]:
+            botones.append(btn(f"{prod} (contenido)", f"{prefijo}:{tok(prod)}", style=AZUL, icono="infinito"))
+        else:
+            n = info["stock"]
+            botones.append(btn(f"{prod} ({n})", f"{prefijo}:{tok(prod)}", style=VERDE if n > 0 else ROJO,
+                               icono="stock" if n > 0 else "error"))
     if botones:
         m.add(*botones)
-    m.add(btn("🏠 Menú Principal", "inicio", style=AZUL))
+    m.add(btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
     bot.reply_to(message, titulo, reply_markup=m)
 
 
 @bot.message_handler(commands=["cargar"])
 def cmd_cargar(message):
     if solo_admin(message):
-        _menu_carga(message, "cargar", "📥 <b>CARGA DE INVENTARIO</b>\n\nSelecciona el producto (formato <code>email:pass</code> o <code>link</code>):")
+        _menu_carga(message, "cargar", f"{ic('stock')} <b>CARGA DE INVENTARIO</b>\n\nSelecciona la plataforma. Se valida el formato según su modalidad.\n"
+                                       "<i>Las plataformas a correo / a dominio no usan stock.</i>")
 
 
 @bot.message_handler(commands=["cargar_lote"])
 def cmd_cargar_lote(message):
     if solo_admin(message):
-        _menu_carga(message, "lotecar", "📦 <b>CARGA MASIVA</b>\n\nSelecciona el producto para el lote:")
+        _menu_carga(message, "lotecar", f"{ic('stock')} <b>CARGA MASIVA</b>\n\nSelecciona la plataforma y pega tu lote completo (una línea por cuenta/link):")
 
 
 @bot.message_handler(commands=["historial"])
@@ -1019,11 +1341,9 @@ def cmd_historial(message):
         return
     uid, uname, nombre, _ = obtener_datos_usuario(target)
     compras = q("SELECT id, producto, credenciales, precio, fecha FROM historial_compras WHERE user_id = %s ORDER BY id DESC", (uid,))
-    bot.reply_to(
-        message,
-        f"📋 <b>EXPEDIENTE DEL CLIENTE</b>\n\n👤 {esc(nombre)} (<code>{esc(uname)}</code>)\n🆔 <code>{uid}</code>\n🛍️ Compras: <code>{len(compras)}</code>",
-        reply_markup=boton_volver_menu(),
-    )
+    bot.reply_to(message,
+                 f"📋 <b>EXPEDIENTE DEL CLIENTE</b>\n\n👤 {esc(nombre)} (<code>{esc(uname)}</code>)\n🆔 <code>{uid}</code>\n🛍️ Compras: <code>{len(compras)}</code>",
+                 reply_markup=boton_volver_menu())
     if compras:
         txt = [f"=== HISTORIAL: {uid} ({uname}) ===", f"Cliente: {nombre} | Compras: {len(compras)}", "=" * 60, ""]
         for cid, prod, cred, prec, fec in compras:
@@ -1036,7 +1356,14 @@ def cmd_noti(message):
     if not solo_admin(message):
         return
     set_estado(ADMIN_ID, "noti_global")
-    bot.reply_to(message, "📢 <b>ANUNCIO GLOBAL</b>\n\nEnvía la <b>imagen con texto</b> o el <b>mensaje</b> a difundir:", reply_markup=boton_cancelar())
+    bot.reply_to(
+        message,
+        "📢 <b>ANUNCIO GLOBAL</b>\n\n"
+        "Escribe aquí el anuncio con el <b>formato de Telegram</b> (negrita, cursiva, cita, emojis) "
+        "o envía una <b>foto con texto</b>.\n\n"
+        "El bot lo copiará <b>tal cual</b> a todos los clientes. "
+        "Después elegirás el botón que llevará y verás una vista previa antes de enviar.",
+        reply_markup=boton_cancelar())
 
 
 @bot.message_handler(commands=["enviar"])
@@ -1065,7 +1392,8 @@ def cmd_borrar(message):
         return
     n = q("DELETE FROM stock WHERE id = %s AND vendido = 0", (int(partes[1]),), fetch=None)
     invalidar_cache()
-    bot.reply_to(message, f"🗑️ Cuenta <code>{partes[1]}</code> eliminada." if n else f"❌ No hay cuenta disponible con ID <code>{partes[1]}</code>.", reply_markup=boton_volver_menu())
+    bot.reply_to(message, f"🗑️ Cuenta <code>{partes[1]}</code> eliminada." if n else f"❌ No hay cuenta disponible con ID <code>{partes[1]}</code>.",
+                 reply_markup=boton_volver_menu())
 
 
 @bot.message_handler(commands=["vaciar"])
@@ -1104,8 +1432,7 @@ def cmd_stats(message):
         f"💵 Ingresos: <code>{ingresos:.2f} USDT</code>\n"
         f"💎 Pagos Binance verificados: <code>{n_pagos}</code> (<code>{total_pagos:.2f} USDT</code>)\n"
         f"📦 Cuentas en stock: <code>{stock}</code>",
-        reply_markup=boton_volver_menu(),
-    )
+        reply_markup=boton_volver_menu())
 
 
 @bot.message_handler(commands=["usuarios"])
@@ -1117,6 +1444,39 @@ def cmd_usuarios(message):
     for uid, uname, nom, comp, fec in filas:
         lineas.append(f"ID: {uid} | @{uname or 'Sin_user'} | {nom} | Compras: {comp} | Registro: {fec}")
     enviar_archivo_txt(message.chat.id, "\n".join(lineas), "clientes_tienda.txt", f"👥 <b>{len(filas)}</b> clientes registrados")
+
+
+# ---------------------------------------------------------------------
+# 🎨 /iconos — asignar emojis premium a los botones y textos
+# ---------------------------------------------------------------------
+def vista_iconos():
+    estado_txt = "✅ activados" if _iconos_on[0] else "⛔ desactivados (Telegram los rechazó)"
+    texto = (
+        "🎨 <b>ÍCONOS PERSONALIZADOS</b>\n\n"
+        "Reemplazan los emojis normales por <b>emojis premium</b> en botones y mensajes.\n"
+        "Pulsa una opción y envíame <b>un emoji premium</b> (necesitas Telegram Premium para enviarlo).\n\n"
+        f"Estado: {estado_txt}\n"
+        "<i>Telegram solo los permite si el dueño del bot tiene Telegram Premium. Si no, se siguen viendo los emojis normales.</i>"
+    )
+    m = InlineKeyboardMarkup(row_width=2)
+    for clave, (fb, nombre) in ICONOS.items():
+        asignado = clave in _iconos_ids
+        m.add(_TgButton(f"{'✓ ' if asignado else ''}{fb} {nombre}", callback_data=f"ico:{clave}",
+                        **({"style": VERDE if asignado else AZUL} if _estilo_ok[0] else {})))
+    m.row(btn("Probar íconos", "ico:_test", style=VERDE, icono="ok"),
+          btn("Reactivar", "ico:_on", style=AZUL, icono="rayo"))
+    m.row(btn("Quitar todos", "ico:_reset", style=ROJO, icono="error"),
+          btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
+    return texto, m
+
+
+@bot.message_handler(commands=["iconos"])
+def cmd_iconos(message):
+    if not solo_admin(message):
+        return
+    limpiar_estados_usuario(ADMIN_ID)
+    texto, m = vista_iconos()
+    bot.reply_to(message, texto, reply_markup=m)
 
 
 # =====================================================================
@@ -1135,7 +1495,6 @@ def callbacks(call):
     clave = (uid, data)
 
     if not es_cantidad:
-        # Anti doble-clic: ignora toques repetidos mientras se procesa o recién procesado.
         if clave in _en_vuelo or _es_duplicado(uid, data):
             return _responder_async(call)
         _en_vuelo.add(clave)
@@ -1152,6 +1511,13 @@ def callbacks(call):
         _en_vuelo.discard(clave)
 
 
+def _sesion_compra(uid, nombre, pasos):
+    st = estado.get(uid)
+    if st and st.get("flujo") == "compra" and st.get("producto") == nombre and st.get("paso") in pasos:
+        return st
+    return None
+
+
 def _manejar_callback(call, data):
     user = call.from_user
     uid = user.id
@@ -1162,7 +1528,7 @@ def _manejar_callback(call, data):
     accion = partes[0]
     registrar_usuario(user)
 
-    # ---------- Navegación ----------
+    # ============================ CLIENTE ============================
     if accion == "inicio":
         _responder_async(call)
         limpiar_estados_usuario(uid)
@@ -1178,7 +1544,7 @@ def _manejar_callback(call, data):
     if accion == "panel_admin":
         _responder_async(call)
         if es_admin:
-            editar(msg, TEXTO_CMDS_ADMIN, boton_volver_menu())
+            editar(msg, texto_cmds_admin(), boton_volver_menu())
         return
 
     if accion == "perfil":
@@ -1188,27 +1554,19 @@ def _manejar_callback(call, data):
         hist = ""
         if ultimas:
             hist = "\n\n📋 <b>Tus últimas compras:</b>\n" + "\n".join(f"• <b>{esc(p)}</b>: <code>{esc(cr)}</code>" for p, cr in ultimas)
-        texto = (
-            "👤 <b>TU CUENTA</b>\n\n"
-            f"🏷️ Nombre: {esc(nombre)}\n"
-            f"🔗 Username: <code>{esc(uname)}</code>\n"
-            f"🆔 ID: <code>{uid_}</code>\n"
-            f"🛍️ Compras totales: <code>{compras}</code>{hist}"
-        )
+        texto = (f"{ic('perfil')} <b>TU CUENTA</b>\n\n"
+                 f"<b>Nombre:</b> {esc(nombre)}\n<b>Username:</b> <code>{esc(uname)}</code>\n"
+                 f"<b>ID:</b> <code>{uid_}</code>\n<b>Compras totales:</b> <code>{compras}</code>{hist}")
         return editar(msg, texto, boton_volver_menu())
 
     if accion == "soporte":
         _responder_async(call)
         set_estado(uid, "soporte")
         m = InlineKeyboardMarkup()
-        m.add(
-            btn("💬 Soporte Directo", url=f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", style=AZUL),
-            btn("🏠 Menú Principal", "inicio", style=AZUL),
-        )
-        return editar(msg, "🛠️ <b>CENTRO DE SOPORTE</b>\n\nEscribe tu consulta o reporte aquí en el chat y el administrador te atenderá:", m)
+        m.add(boton_admin_url(), btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
+        return editar(msg, f"{ic('soporte')} <b>CENTRO DE SOPORTE</b>\n\nEscribe tu consulta o reporte aquí en el chat y el administrador te atenderá:", m)
 
-    # ---------- Responder a un cliente (admin) ----------
-    if accion == "noti":
+    if accion == "noti":   # el admin pulsa «Responder» en un aviso
         _responder_async(call)
         if es_admin:
             try:
@@ -1219,7 +1577,7 @@ def _manejar_callback(call, data):
             bot.send_message(chat_id, f"📨 Escribe tu respuesta para <code>{target}</code>:", reply_markup=boton_cancelar())
         return
 
-    # ---------- Selección de producto (cliente) ----------
+    # ---- Elegir plataforma: muestra la información ----
     if accion == "sel":
         nombre = resolver_token(partes[1]) if len(partes) > 1 else None
         info = catalogo_completo().get(nombre) if nombre else None
@@ -1227,64 +1585,28 @@ def _manejar_callback(call, data):
             _responder(call, "Este producto ya no está disponible.", True)
             texto, m = vista_catalogo()
             return editar(msg, texto, m)
-
-        precio = info["precio"]
-        if info["correo"]:
-            _responder_async(call)
-            set_estado(uid, "compra", tipo="correo", producto=nombre)
-            m = InlineKeyboardMarkup()
-            m.add(btn("❌ Cancelar", "catalogo", style=ROJO))
-            return editar(msg,
-                          f"📧 <b>{esc(nombre.upper())}</b> (activación a correo)\n\n"
-                          f"💵 Precio: <code>{precio:.2f} USDT</code>\n\n"
-                          "👉 Envía ahora tu <b>correo electrónico</b> para continuar:", m)
-
-        if info["stock"] <= 0:
-            # 🔴 SIN STOCK → aviso inmediato + mensaje del bot
+        if not info["disponible"]:
             _responder(call, f"🔴 Sin stock en {nombre}")
             texto, m = vista_sin_stock(nombre)
             return editar(msg, texto, m)
-
         _responder_async(call)
-        set_estado(uid, "compra", tipo="stock", producto=nombre, cantidad=1, creado_ms=int(time.time() * 1000))
-        texto, m = menu_cantidad(nombre, 1, precio, info["stock"])
+        set_estado(uid, "compra", paso="elegir", producto=nombre, cantidad=1, modalidad=info["modalidad"])
+        texto, m = vista_producto(nombre, info, 1)
         return editar(msg, texto, m)
 
-    # ---------- Cantidad / pago (cliente) ----------
+    # ---- Cantidad ----
     if accion == "cant":
         sub = partes[1]
         nombre = resolver_token(partes[2]) if len(partes) > 2 else None
-        st = estado.get(uid)
-        if (not nombre or not st or st.get("flujo") != "compra" or st.get("tipo") != "stock"
-                or st.get("producto") != nombre):
+        st = _sesion_compra(uid, nombre, ("elegir",)) if nombre else None
+        info = catalogo_completo().get(nombre) if nombre else None
+        if not st or not info or info["manual"]:
             return _responder(call, "La sesión expiró. Vuelve al catálogo.", True)
-
-        if sub == "ok":
-            _responder_async(call)
-            stock = stock_en_vivo(nombre)
-            cantidad = st.get("cantidad", 1)
-            if stock <= 0:
-                invalidar_cache()
-                texto, m = vista_sin_stock(nombre)
-                return editar(msg, texto, m)
-            if stock < cantidad:
-                invalidar_cache()
-                st["cantidad"] = stock
-                texto, m = menu_cantidad(nombre, stock, precio_en_vivo(nombre), stock)
-                return editar(msg, "⚠️ <i>El stock cambió, ajustamos tu cantidad.</i>\n\n" + texto, m)
-            precio_unit = precio_en_vivo(nombre)
-            total = a_dec(precio_unit) * cantidad
-            st["total"] = total
-            st["creado_ms"] = int(time.time() * 1000)
-            enviar_pago(chat_id, texto_instrucciones_pago(nombre, cantidad, total))
-            return _borrar(chat_id, msg.message_id)
-
-        info = catalogo_completo().get(nombre)
-        stock = info["stock"] if info else 0
+        limite = MAX_CANT_INFINITO if info["infinito"] else info["stock"]
         cantidad = st.get("cantidad", 1)
         if sub == "mas":
-            if cantidad >= stock:
-                return _responder(call, f"Máximo disponible: {stock}")
+            if cantidad >= limite:
+                return _responder(call, f"Máximo disponible: {limite}")
             cantidad += 1
         elif sub == "menos":
             if cantidad <= 1:
@@ -1292,23 +1614,224 @@ def _manejar_callback(call, data):
             cantidad -= 1
         _responder_async(call)
         st["cantidad"] = cantidad
-        texto, m = menu_cantidad(nombre, cantidad, info["precio"] if info else 0, stock)
+        texto, m = vista_producto(nombre, info, cantidad)
         return editar(msg, texto, m)
 
-    # ---------- Todo lo que sigue es solo para el admin ----------
+    # ---- Pagar con Binance ----
+    if accion == "pagar":
+        nombre = resolver_token(partes[1]) if len(partes) > 1 else None
+        st = _sesion_compra(uid, nombre, ("elegir",)) if nombre else None
+        if not st:
+            return _responder(call, "La sesión expiró. Vuelve al catálogo.", True)
+        _responder_async(call)
+        info = info_fresca(nombre)
+        if not info or not info["disponible"]:
+            texto, m = vista_sin_stock(nombre)
+            return editar(msg, texto, m)
+        cantidad = st.get("cantidad", 1)
+        if not info["manual"] and not info["infinito"] and info["stock"] < cantidad:
+            st["cantidad"] = info["stock"]
+            texto, m = vista_producto(nombre, info, info["stock"])
+            return editar(msg, "⚠️ <i>El stock cambió, ajustamos tu cantidad.</i>\n\n" + texto, m)
+        if info["manual"]:
+            cantidad = st["cantidad"] = 1
+        st["total"] = a_dec(info["precio"]) * cantidad
+        st["modalidad"] = info["modalidad"]
+
+        if info["modalidad"] == "correo":
+            st["paso"] = "correo"
+            return editar(msg,
+                          f"{ic('correo')} <b>{esc(nombre.upper())}</b>\n\n"
+                          "Envía tu <b>correo electrónico</b>. A ese correo te enviaremos la invitación/activación.\n\n"
+                          "<b>Ejemplo:</b> <code>micorreo@gmail.com</code>",
+                          boton_cancelar("catalogo"))
+        if info["modalidad"] == "dominio":
+            st["paso"] = "usuario"
+            return editar(msg,
+                          f"{ic('dominio')} <b>{esc(nombre.upper())}</b>\n\n"
+                          "Envía tu <b>usuario de Telegram</b> (con @). Lo usaremos para contactarte y entregarte tus datos.\n\n"
+                          "<b>Ejemplo:</b> <code>@miusuario</code>",
+                          boton_cancelar("catalogo"))
+        mostrar_pago(chat_id, st)
+        return _borrar(chat_id, msg.message_id)
+
+    # ---- «Ya pagué» → pide el ID de orden ----
+    if accion == "yp":
+        st = estado.get(uid)
+        if not st or st.get("flujo") != "compra" or st.get("paso") != "pago":
+            return _responder(call, "La sesión expiró. Vuelve al catálogo.", True)
+        _responder_async(call)
+        st["paso"] = "id"
+        return editar(msg, texto_pedir_id(), boton_cancelar("catalogo"))
+
+    # ============================ ADMIN ============================
     if not es_admin:
         return _responder(call)
 
     _responder_async(call)
-    nombre = resolver_token(partes[1]) if len(partes) > 1 else None
 
+    # ---- Íconos ----
+    if accion == "ico":
+        sub = partes[1] if len(partes) > 1 else ""
+        if sub == "_test":
+            m = InlineKeyboardMarkup(row_width=3)
+            m.add(*[btn(nombre, "nada", style=AZUL, icono=c) for c, (_, nombre) in ICONOS.items()])
+            bot.send_message(chat_id, f"🧪 <b>Prueba de íconos</b>\n{ic('ok')} {ic('tienda')} {ic('pagar')} {ic('infinito')}\n"
+                                      "Si ves los íconos premium, funcionan. Si ves emojis normales, tu bot no los admite.", reply_markup=m)
+            if not _iconos_on[0]:
+                bot.send_message(chat_id, "⛔ Telegram rechazó los íconos y se desactivaron. Usa «Reactivar» para intentarlo de nuevo.")
+            return
+        if sub == "_on":
+            _iconos_on[0] = True
+            texto, m = vista_iconos()
+            return editar(msg, texto, m)
+        if sub == "_reset":
+            q("DELETE FROM iconos", fetch=None)
+            _iconos_ids.clear()
+            texto, m = vista_iconos()
+            return editar(msg, texto, m)
+        if sub in ICONOS:
+            set_estado(ADMIN_ID, "icono", clave=sub)
+            return editar(msg, f"🎨 <b>Ícono para «{esc(ICONOS[sub][1])}»</b>\n\n"
+                               "Envíame ahora <b>un emoji premium</b>.\n"
+                               "Para volver al emoji normal escribe <code>quitar</code>.", boton_cancelar())
+        return
+
+    # ---- Anuncio global: botón, vista previa y envío ----
+    if accion == "nt":
+        st = estado.get(uid)
+        if not st or st.get("flujo") != "noti_botones":
+            return editar(msg, "⚠️ La sesión expiró. Usa /noti para empezar de nuevo.", boton_volver_menu())
+        sub = partes[1] if len(partes) > 1 else ""
+        if sub == "go":
+            if st.get("opt") is None:
+                return
+            markup = _markup_difusion(st["opt"])
+            estado.pop(uid, None)
+            editar(msg, f"📢 Enviando a <code>{st['total']}</code> usuarios en segundo plano...\nPuedes seguir usando el bot.", None)
+            Thread(target=_copiar_a_todos, daemon=True,
+                   args=(st["src_chat"], st["src_msg"], markup, chat_id, msg.message_id)).start()
+            return
+        st["opt"] = sub
+        try:
+            apihelper.copy_message(TELEGRAM_TOKEN, ADMIN_ID, st["src_chat"], st["src_msg"], reply_markup=_markup_difusion(sub))
+        except Exception as e:
+            return editar(msg, f"❌ No pude generar la vista previa: <code>{esc(e)}</code>", boton_volver_menu())
+        m = InlineKeyboardMarkup(row_width=1)
+        m.add(btn(f"Enviar a {st['total']} usuarios", "nt:go", style=VERDE, icono="ok"),
+              btn("Cancelar", "inicio", style=ROJO, icono="error"))
+        return editar(msg, "👀 <b>Esa es la vista previa</b> (el mensaje de arriba).\n\n¿Lo envío a todos los clientes?", m)
+
+    # ---- Agregar plataforma: respuestas con botones ----
+    if accion in ("addm", "addd", "addi", "addc"):
+        st = estado.get(uid)
+        if not st or st.get("flujo") != "agregar":
+            return editar(msg, "⚠️ La sesión expiró. Usa /agregar_plataforma para empezar de nuevo.", boton_volver_menu())
+        sub = partes[1] if len(partes) > 1 else ""
+        if accion == "addm" and st["paso"] == "modalidad" and sub in MODALIDADES:
+            st["modalidad"] = sub
+            st["paso"] = "desc"
+            m = InlineKeyboardMarkup(row_width=1)
+            m.add(btn("Descripción automática", "addd:auto", style=VERDE, icono="rayo"),
+                  btn("Cancelar", "inicio", style=ROJO, icono="error"))
+            return editar(msg, f"<b>Paso 4/5 · Descripción</b>\n\n{TEXTO_SINTAXIS_DESC}\n\n"
+                               "O pulsa <b>Descripción automática</b> y la edito por ti (luego puedes cambiarla con /modificar_descripcion).", m)
+        if accion == "addd" and st["paso"] == "desc" and sub == "auto":
+            st["desc"] = descripcion_auto(st["nombre"], st["modalidad"], False)
+            return _tras_descripcion(msg, st, True)
+        if accion == "addi" and st["paso"] == "infinito" and sub in ("si", "no"):
+            st["infinito"] = sub == "si"
+            if not st["infinito"]:
+                return _guardar_plataforma(msg, st, True)
+            st["paso"] = "contenido"
+            m = InlineKeyboardMarkup(row_width=1)
+            m.add(btn("Omitir (lo cargo después)", "addc:skip", style=AZUL, icono="volver"),
+                  btn("Cancelar", "inicio", style=ROJO, icono="error"))
+            return editar(msg, "♾️ <b>Stock infinito</b>\n\nEnvía el <b>link o texto</b> que se entregará a <b>todos</b> los compradores.\n\n"
+                               f"<b>Ejemplo:</b> <code>https://mi-sitio.com/metodo-123</code>", m)
+        if accion == "addc" and st["paso"] == "contenido" and sub == "skip":
+            st["contenido"] = None
+            return _guardar_plataforma(msg, st, True)
+        return
+
+    # ---- Cambiar modalidad ----
+    if accion == "mm":
+        nombre = resolver_token(partes[1]) if len(partes) > 1 else None
+        info = catalogo_completo().get(nombre) if nombre else None
+        if not info:
+            return editar(msg, "⚠️ Esa plataforma ya no existe.", boton_volver_menu())
+        m = teclado_modalidades(lambda mod: f"mms:{tok(nombre)}:{mod}")
+        return editar(msg, f"🔁 <b>MODALIDAD DE</b> <code>{esc(nombre)}</code>\n\n"
+                           f"Actual: <b>{MODALIDADES[info['modalidad']]}</b>\n\n{TEXTO_MODALIDADES}", m)
+
+    if accion == "mms":
+        nombre = resolver_token(partes[1]) if len(partes) > 1 else None
+        nueva = partes[2] if len(partes) > 2 else ""
+        info = catalogo_completo().get(nombre) if nombre else None
+        if not info or nueva not in MODALIDADES:
+            return editar(msg, "⚠️ Esa plataforma ya no existe.", boton_volver_menu())
+        if nueva in MANUALES:
+            q("UPDATE catalogo_db SET modalidad = %s, infinito = FALSE, entrega_infinita = NULL WHERE producto = %s", (nueva, nombre), fetch=None)
+        else:
+            q("UPDATE catalogo_db SET modalidad = %s WHERE producto = %s", (nueva, nombre), fetch=None)
+        invalidar_cache()
+        aviso = ""
+        if info["stock"] and nueva in MANUALES:
+            aviso = "\n\n⚠️ <i>Esta modalidad no usa stock; las cuentas cargadas quedan guardadas pero no se entregan.</i>"
+        elif info["stock"] and nueva != info["modalidad"]:
+            aviso = "\n\n⚠️ <i>El stock ya cargado conserva su formato anterior. Revísalo con /stock.</i>"
+        return editar(msg, f"✅ <b>Modalidad actualizada</b>\n\n<code>{esc(nombre)}</code>\n➔ <b>{MODALIDADES[nueva]}</b>{aviso}", boton_volver_menu())
+
+    # ---- Stock infinito / normal ----
+    if accion == "ms":
+        nombre = resolver_token(partes[1]) if len(partes) > 1 else None
+        info = catalogo_completo().get(nombre) if nombre else None
+        if not info:
+            return editar(msg, "⚠️ Esa plataforma ya no existe.", boton_volver_menu())
+        return _pantalla_stock(msg, nombre, info)
+
+    if accion == "stk":
+        sub = partes[1] if len(partes) > 1 else ""
+        nombre = resolver_token(partes[2]) if len(partes) > 2 else None
+        info = catalogo_completo().get(nombre) if nombre else None
+        if not info:
+            return editar(msg, "⚠️ Esa plataforma ya no existe.", boton_volver_menu())
+        if info["manual"]:
+            return editar(msg, "ℹ️ Esta modalidad no usa stock.", boton_volver_menu())
+        if sub == "inf":
+            set_estado(uid, "inf_activar", producto=nombre)
+            return editar(msg, f"♾️ <b>STOCK INFINITO PARA</b> <code>{esc(nombre)}</code>\n\n"
+                               "Envía el <b>link o texto</b> que se entregará a <b>todos</b> los compradores (siempre el mismo).\n\n"
+                               "<b>Ejemplo:</b> <code>https://mi-sitio.com/metodo-123</code>", boton_cancelar())
+        if sub in ("cont", "carga"):
+            set_estado(uid, "carga", producto=nombre)
+            return editar(msg, _texto_pedir_carga(nombre, info), boton_cancelar())
+        if sub == "normal":
+            q("UPDATE catalogo_db SET infinito = FALSE, entrega_infinita = NULL WHERE producto = %s", (nombre,), fetch=None)
+            invalidar_cache()
+            return editar(msg, f"✅ <code>{esc(nombre)}</code> volvió a <b>stock normal</b>.\nCarga cuentas con /cargar.", boton_volver_menu())
+        if sub == "vac":
+            m = InlineKeyboardMarkup(row_width=2)
+            m.add(btn("Sí, vaciar", f"stk:vacok:{tok(nombre)}", style=ROJO, icono="error"),
+                  btn("Cancelar", "inicio", style=AZUL, icono="volver"))
+            return editar(msg, f"⚠️ <b>¿Vaciar el stock disponible de</b> <code>{esc(nombre)}</code><b>?</b>\n"
+                               f"Se eliminarán <code>{info['stock']}</code> cuentas no vendidas.", m)
+        if sub == "vacok":
+            n = q("DELETE FROM stock WHERE producto = %s AND vendido = 0", (nombre,), fetch=None)
+            invalidar_cache()
+            return editar(msg, f"🗑️ Se eliminaron <code>{n}</code> cuentas de <b>{esc(nombre)}</b>.", boton_volver_menu())
+        return
+
+    # ---- Resto: acciones sobre una plataforma (token en partes[1]) ----
+    nombre = resolver_token(partes[1]) if len(partes) > 1 else None
     if accion in ("delplat", "delok", "modnom", "moddesc", "prec", "cargar", "lotecar") and not nombre:
-        texto, m = vista_catalogo("⚠️ <i>Ese producto ya no existe.</i>\n\n")
+        texto, m = vista_catalogo("⚠️ <i>Esa plataforma ya no existe.</i>\n\n")
         return editar(msg, texto, m)
 
     if accion == "delplat":
         m = InlineKeyboardMarkup(row_width=2)
-        m.add(btn("✅ Sí, eliminar", f"delok:{tok(nombre)}", style=ROJO), btn("↩️ Cancelar", "inicio", style=AZUL))
+        m.add(btn("Sí, eliminar", f"delok:{tok(nombre)}", style=ROJO, icono="error"),
+              btn("Cancelar", "inicio", style=AZUL, icono="volver"))
         return editar(msg, f"⚠️ <b>¿Eliminar</b> <code>{esc(nombre)}</code> <b>del catálogo?</b>\n\nEsta acción no se puede deshacer.", m)
 
     if accion == "delok":
@@ -1323,20 +1846,103 @@ def _manejar_callback(call, data):
 
     if accion == "moddesc":
         set_estado(uid, "mod_desc", producto=nombre)
-        return editar(msg, f"📌 <b>CAMBIAR DESCRIPCIÓN DE:</b> <code>{esc(nombre)}</code>\n\n👉 Escribe la nueva descripción (Ej: <code>email:pass</code>, <code>link</code>):", boton_cancelar())
+        actual = catalogo_completo()[nombre]["desc"]
+        return editar(msg, f"📌 <b>CAMBIAR DESCRIPCIÓN DE:</b> <code>{esc(nombre)}</code>\n\n{TEXTO_SINTAXIS_DESC}\n\n"
+                           f"<b>Descripción actual (puedes copiarla y editarla):</b>\n<code>{esc(actual)}</code>", boton_cancelar())
 
     if accion == "prec":
         set_estado(uid, "precio", producto=nombre)
         actual = catalogo_completo()[nombre]["precio"]
         return editar(msg, f"💵 <b>CAMBIAR PRECIO DE:</b> <code>{esc(nombre)}</code>\n\nActual: <code>{actual:.2f} USDT</code>\n\n👉 Escribe el nuevo precio (Ej: <code>3.50</code>):", boton_cancelar())
 
-    if accion == "cargar":
+    if accion in ("cargar", "lotecar"):
+        info = catalogo_completo()[nombre]
+        if info["manual"]:
+            return editar(msg, f"ℹ️ <b>{esc(nombre)}</b> es de modalidad <b>{MOD_CORTO[info['modalidad']]}</b> y no usa stock.", boton_volver_menu())
         set_estado(uid, "carga", producto=nombre)
-        return editar(msg, f"📥 <b>Cargando stock para:</b> <code>{esc(nombre)}</code>\n\nEnvía las cuentas o links, una por línea:", boton_cancelar())
+        return editar(msg, _texto_pedir_carga(nombre, info), boton_cancelar())
 
-    if accion == "lotecar":
-        set_estado(uid, "carga", producto=nombre)
-        return editar(msg, f"📦 <b>Carga masiva para:</b> <code>{esc(nombre)}</code>\n\nPega tu bloque completo, una cuenta/link por línea:", boton_cancelar())
+
+def _texto_pedir_carga(nombre, info):
+    if info["infinito"]:
+        return (f"♾️ <b>CONTENIDO INFINITO DE</b> <code>{esc(nombre)}</code>\n\n"
+                "Envía el <b>link o texto</b> que se entregará a todos los compradores (reemplaza al actual).\n\n"
+                "<b>Ejemplo:</b> <code>https://mi-sitio.com/metodo-123</code>")
+    if info["modalidad"] == "link":
+        return (f"{ic('link')} <b>Cargando links para:</b> <code>{esc(nombre)}</code>\n\n"
+                "Envía los links de activación, <b>uno por línea</b>. Solo se aceptan links que empiecen con <code>https://</code>.\n\n"
+                "<b>Ejemplo:</b>\n<code>https://ejemplo.com/activar/abc123\nhttps://ejemplo.com/activar/def456</code>")
+    return (f"{ic('stock')} <b>Cargando cuentas para:</b> <code>{esc(nombre)}</code>\n\n"
+            "Envía las cuentas, <b>una por línea</b>, en formato <code>correo:contraseña</code>. Otros formatos serán rechazados.\n\n"
+            "<b>Ejemplo:</b>\n<code>usuario1@gmail.com:Clave123\nusuario2@gmail.com:Clave456</code>")
+
+
+def _pantalla_stock(msg, nombre, info):
+    m = InlineKeyboardMarkup(row_width=1)
+    t = tok(nombre)
+    if info["manual"]:
+        return editar(msg, f"ℹ️ <b>{esc(nombre)}</b> es de modalidad <b>{MOD_CORTO[info['modalidad']]}</b>.\n"
+                           "Esta modalidad no usa stock (siempre está disponible).", boton_volver_menu())
+    if info["infinito"]:
+        estado_txt = "Ilimitado" if info["tiene_contenido"] else "Sin contenido cargado"
+        m.add(btn("Cambiar contenido a entregar", f"stk:cont:{t}", style=AZUL, icono="infinito"),
+              btn("Volver a stock normal", f"stk:normal:{t}", style=ROJO, icono="stock"))
+    else:
+        estado_txt = f"{info['stock']} disponibles"
+        m.add(btn("Poner stock INFINITO", f"stk:inf:{t}", style=AZUL, icono="infinito"),
+              btn("Cargar stock", f"stk:carga:{t}", style=VERDE, icono="stock"),
+              btn("Vaciar stock disponible", f"stk:vac:{t}", style=ROJO, icono="error"))
+    m.add(btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
+    return editar(msg, f"♾️ <b>STOCK DE</b> <code>{esc(nombre)}</code>\n\n<b>Estado:</b> {estado_txt}\n"
+                       f"<b>Modalidad:</b> {MODALIDADES[info['modalidad']]}", m)
+
+
+# ---------------------------------------------------------------------
+# 📢 Anuncio global (copia exacta del mensaje del admin)
+# ---------------------------------------------------------------------
+def _markup_difusion(opt):
+    if opt in (None, "none"):
+        return None
+    m = InlineKeyboardMarkup(row_width=1)
+    if opt == "cat":
+        m.add(btn("Ver Catálogo", "catalogo", style=VERDE, icono="tienda"))
+        return m
+    nombre = resolver_token(opt)
+    info = catalogo_completo().get(nombre) if nombre else None
+    if not info:
+        return None
+    etiqueta = f"COMPRAR | ${info['precio']:.2f}"
+    if not info["manual"] and not info["infinito"]:
+        etiqueta += f" | {info['stock']}"
+    m.add(btn(etiqueta, f"sel:{tok(nombre)}", style=VERDE, icono="tienda"),
+          btn("Ver Catálogo", "catalogo", style=AZUL, icono="tienda"))
+    return m
+
+
+def _copiar_a_todos(src_chat, src_msg, markup, aviso_chat, aviso_id):
+    todos = [r[0] for r in q("SELECT user_id FROM usuarios")]
+    enviados = fallos = 0
+    for destino in todos:
+        for intento in (1, 2):
+            try:
+                apihelper.copy_message(TELEGRAM_TOKEN, destino, src_chat, src_msg, reply_markup=markup)
+                enviados += 1
+                break
+            except ApiTelegramException as e:
+                if e.error_code == 429 and intento == 1:
+                    espera = (getattr(e, "result_json", {}).get("parameters") or {}).get("retry_after", 3)
+                    time.sleep(min(int(espera) + 1, 30))
+                    continue
+                fallos += 1
+                break
+            except Exception:
+                fallos += 1
+                break
+        time.sleep(0.05)
+    editar_o_enviar(aviso_chat, aviso_id,
+                    "✅ <b>Difusión completada</b>\n\n"
+                    f"📨 Recibieron el anuncio: <code>{enviados}</code>\n"
+                    f"🚫 No lo recibieron (bloquearon el bot): <code>{fallos}</code>", boton_volver_menu())
 
 
 # =====================================================================
@@ -1352,6 +1958,9 @@ def _texto_o_aviso(message, aviso="⚠️ Envía el dato como texto."):
 def flujo_mod_nombre(message, st):
     texto = _texto_o_aviso(message)
     if texto is None:
+        return True
+    if not texto or len(texto) > 80:
+        bot.reply_to(message, "❌ El nombre debe tener entre 1 y 80 caracteres.", reply_markup=boton_cancelar())
         return True
     estado.pop(ADMIN_ID, None)
     antiguo = st["producto"]
@@ -1373,10 +1982,14 @@ def flujo_mod_desc(message, st):
     texto = _texto_o_aviso(message)
     if texto is None:
         return True
+    if len(texto) > LIMITE_DESC:
+        bot.reply_to(message, f"❌ Muy larga ({len(texto)} caracteres). El máximo es {LIMITE_DESC}.", reply_markup=boton_cancelar())
+        return True
     estado.pop(ADMIN_ID, None)
     q("UPDATE catalogo_db SET descripcion = %s WHERE producto = %s", (texto, st["producto"]), fetch=None)
     invalidar_cache()
-    bot.reply_to(message, f"✅ <b>Descripción actualizada</b>\n\n📦 <code>{esc(st['producto'])}</code>\n📌 <code>{esc(texto)}</code>", reply_markup=boton_volver_menu())
+    bot.reply_to(message, f"✅ <b>Descripción actualizada</b> — <code>{esc(st['producto'])}</code>\n\n"
+                          f"<b>Así la verá el cliente:</b>\n<blockquote>{formatear_descripcion(texto)}</blockquote>", reply_markup=boton_volver_menu())
     return True
 
 
@@ -1394,19 +2007,75 @@ def flujo_precio(message, st):
     estado.pop(ADMIN_ID, None)
     q("UPDATE catalogo_db SET precio = %s WHERE producto = %s", (nuevo, st["producto"]), fetch=None)
     invalidar_cache()
-    bot.reply_to(message, f"✅ <b>Precio actualizado</b>\n\n📦 <code>{esc(st['producto'])}</code>\n💵 <code>{nuevo:.2f} USDT</code>", reply_markup=boton_volver_menu())
+    bot.reply_to(message, f"✅ <b>Precio actualizado</b>\n\n<code>{esc(st['producto'])}</code>\n💵 <code>{nuevo:.2f} USDT</code>", reply_markup=boton_volver_menu())
     return True
 
 
+# ---------- Agregar plataforma ----------
+def _salida(obj, boton, texto, markup):
+    """Si la acción viene de un botón se edita el mensaje del bot; si viene de un texto se responde."""
+    if boton:
+        return editar(obj, texto, markup)
+    return bot.reply_to(obj, texto, reply_markup=markup)
+
+
+def _tras_descripcion(obj, st, boton):
+    """Después de la descripción: pregunta por stock infinito (solo email:pass / link) o guarda."""
+    if st["modalidad"] in MANUALES:
+        return _guardar_plataforma(obj, st, boton)
+    st["paso"] = "infinito"
+    m = InlineKeyboardMarkup(row_width=2)
+    m.add(btn("Sí, infinito", "addi:si", style=AZUL, icono="infinito"),
+          btn("No, manual", "addi:no", style=VERDE, icono="stock"))
+    m.row(btn("Cancelar", "inicio", style=ROJO, icono="error"))
+    texto = ("<b>Paso 5/5 · ¿Stock infinito?</b>\n\n"
+             "♾️ <b>Sí</b> — nunca se agota: se entrega siempre el mismo link/texto a todos los compradores.\n"
+             "📦 <b>No</b> — stock normal: cargas las cuentas/links tú mismo.")
+    return _salida(obj, boton, texto, m)
+
+
+def _guardar_plataforma(obj, st, boton):
+    nombre, precio, mod = st["nombre"], st["precio"], st["modalidad"]
+    inf = bool(st.get("infinito")) and mod not in MANUALES
+    contenido = st.get("contenido") if inf else None
+    q("""INSERT INTO catalogo_db (producto, precio, descripcion, modalidad, infinito, entrega_infinita)
+         VALUES (%s, %s, %s, %s, %s, %s)
+         ON CONFLICT (producto) DO UPDATE SET precio = EXCLUDED.precio, descripcion = EXCLUDED.descripcion,
+              modalidad = EXCLUDED.modalidad, infinito = EXCLUDED.infinito, entrega_infinita = EXCLUDED.entrega_infinita""",
+      (nombre, precio, st["desc"], mod, inf, contenido), fetch=None)
+    estado.pop(ADMIN_ID, None)
+    invalidar_cache()
+    extra = ""
+    if inf and not contenido:
+        extra = "\n\n⚠️ <i>Aún no cargaste el contenido a entregar: la plataforma figura sin stock hasta que lo agregues (/modificar_stock).</i>"
+    elif not inf and mod not in MANUALES:
+        extra = "\n\n📦 <i>Carga el stock con /cargar.</i>"
+    texto = (f"✅ <b>¡Plataforma agregada!</b>\n\n<b>Nombre:</b> <code>{esc(nombre)}</code>\n"
+             f"<b>Precio:</b> <code>{precio:.2f} USDT</code>\n<b>Modalidad:</b> {MODALIDADES[mod]}\n"
+             f"<b>Stock:</b> {'♾️ infinito' if inf else ('manual' if mod not in MANUALES else 'no aplica')}\n\n"
+             f"<b>Descripción:</b>\n<blockquote>{formatear_descripcion(st['desc'])}</blockquote>{extra}")
+    return _salida(obj, boton, texto, boton_volver_menu())
+
+
 def flujo_agregar(message, st):
+    paso = st["paso"]
+    if paso in ("modalidad", "infinito"):
+        bot.reply_to(message, "👆 Elige una opción con los botones del mensaje anterior.", reply_markup=boton_cancelar())
+        return True
     texto = _texto_o_aviso(message)
     if texto is None:
         return True
-    if st["paso"] == "nombre":
-        st["nombre"] = texto
-        st["paso"] = "precio"
-        bot.reply_to(message, f"➕ Producto: <code>{esc(texto)}</code>\n\nPaso 2/3: Envía el <b>precio</b> en USDT (Ej: <code>3.50</code>):", reply_markup=boton_cancelar())
-    elif st["paso"] == "precio":
+
+    if paso == "nombre":
+        if not texto or len(texto) > 80:
+            bot.reply_to(message, "❌ El nombre debe tener entre 1 y 80 caracteres.", reply_markup=boton_cancelar())
+            return True
+        if texto in catalogo_completo():
+            bot.reply_to(message, "❌ Ya existe una plataforma con ese nombre. Envía otro nombre:", reply_markup=boton_cancelar())
+            return True
+        st["nombre"], st["paso"] = texto, "precio"
+        bot.reply_to(message, f"{ic('mas')} <code>{esc(texto)}</code>\n\n<b>Paso 2/5 · Precio</b>\nEnvía el precio en USDT (Ej: <code>3.50</code>):", reply_markup=boton_cancelar())
+    elif paso == "precio":
         try:
             precio = round(float(texto.replace(",", ".")), 2)
             if precio < 0:
@@ -1414,43 +2083,136 @@ def flujo_agregar(message, st):
         except ValueError:
             bot.reply_to(message, "❌ Precio inválido. Envía un número (Ej: <code>4.00</code>):", reply_markup=boton_cancelar())
             return True
-        st["precio"] = precio
-        st["paso"] = "desc"
-        bot.reply_to(message, "Paso 3/3: Envía la <b>descripción o modalidad</b> (Ej: <code>email:pass</code>, <code>link</code>):", reply_markup=boton_cancelar())
-    else:
-        q("INSERT INTO catalogo_db (producto, precio, descripcion) VALUES (%s, %s, %s) "
-          "ON CONFLICT (producto) DO UPDATE SET precio = EXCLUDED.precio, descripcion = EXCLUDED.descripcion",
-          (st["nombre"], st["precio"], texto), fetch=None)
-        estado.pop(ADMIN_ID, None)
-        invalidar_cache()
-        bot.reply_to(message, f"✅ <b>Plataforma agregada</b>\n\n📦 <code>{esc(st['nombre'])}</code>\n💵 <code>{st['precio']:.2f} USDT</code>\n📌 <code>{esc(texto)}</code>", reply_markup=boton_volver_menu())
+        st["precio"], st["paso"] = precio, "modalidad"
+        bot.reply_to(message, f"<b>Paso 3/5 ·</b> {TEXTO_MODALIDADES}", reply_markup=teclado_modalidades(lambda mod: f"addm:{mod}"))
+    elif paso == "desc":
+        if len(texto) > LIMITE_DESC:
+            bot.reply_to(message, f"❌ Muy larga ({len(texto)} caracteres). El máximo es {LIMITE_DESC}.", reply_markup=boton_cancelar())
+            return True
+        st["desc"] = texto
+        _tras_descripcion(message, st, False)
+    elif paso == "contenido":
+        if len(texto) > LIMITE_CONTENIDO:
+            bot.reply_to(message, f"❌ Muy largo. El máximo es {LIMITE_CONTENIDO} caracteres.", reply_markup=boton_cancelar())
+            return True
+        st["contenido"] = texto
+        _guardar_plataforma(message, st, False)
     return True
 
 
-def _difundir(es_foto, file_id, caption, texto, aviso_chat, aviso_id):
-    """Difusión en segundo plano: no bloquea al resto de los clientes."""
-    todos = [r[0] for r in q("SELECT user_id FROM usuarios")]
-    enviados = 0
-    for destino in todos:
-        try:
-            if es_foto:
-                bot.send_photo(destino, file_id, caption=f"📢 <b>AVISO OFICIAL</b>\n\n{esc(caption)}", reply_markup=boton_volver_menu())
-            else:
-                bot.send_message(destino, f"📢 <b>AVISO OFICIAL</b>\n\n{esc(texto)}", reply_markup=boton_volver_menu())
-            enviados += 1
-        except Exception:
-            pass
-        time.sleep(0.05)
-    editar_o_enviar(aviso_chat, aviso_id, f"✅ Difusión completada (<code>{enviados}/{len(todos)}</code>).", boton_volver_menu())
+# ---------- Carga de stock (con validación de formato) ----------
+def validar_lineas(modalidad, lineas):
+    regex = RE_EMAIL_PASS if modalidad == "email_pass" else RE_LINK
+    validas, errores = [], []
+    for n, l in enumerate(lineas, 1):
+        (validas if regex.match(l) else errores).append(l if regex.match(l) else (n, l))
+    return validas, errores
 
 
-def flujo_noti_global(message, st):
+def flujo_carga(message, st):
+    texto = _texto_o_aviso(message, "⚠️ Envía las cuentas/links como texto.")
+    if texto is None:
+        return True
+    producto = st["producto"]
+    info = info_fresca(producto)
+    if not info:
+        estado.pop(ADMIN_ID, None)
+        bot.reply_to(message, "❌ Esa plataforma ya no existe.", reply_markup=boton_volver_menu())
+        return True
+
+    # --- Stock infinito: un solo contenido (link o texto) ---
+    if info["infinito"]:
+        if not texto or len(texto) > LIMITE_CONTENIDO:
+            bot.reply_to(message, f"❌ Envía un texto de hasta {LIMITE_CONTENIDO} caracteres.", reply_markup=boton_cancelar())
+            return True
+        q("UPDATE catalogo_db SET entrega_infinita = %s WHERE producto = %s", (texto, producto), fetch=None)
+        estado.pop(ADMIN_ID, None)
+        invalidar_cache()
+        bot.reply_to(message, f"✅ <b>Contenido actualizado</b>\n♾️ <b>{esc(producto)}</b> entregará esto a todos los compradores:\n<code>{esc(texto)}</code>", reply_markup=boton_volver_menu())
+        return True
+
+    if info["manual"]:
+        estado.pop(ADMIN_ID, None)
+        bot.reply_to(message, "ℹ️ Esa modalidad no usa stock.", reply_markup=boton_volver_menu())
+        return True
+
+    # --- Stock normal: formato validado según la modalidad ---
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+    if not lineas:
+        bot.reply_to(message, "❌ El bloque está vacío.", reply_markup=boton_cancelar())
+        return True
+    validas, errores = validar_lineas(info["modalidad"], lineas)
+    if errores:
+        formato = ("<code>correo@dominio.com:contraseña</code>" if info["modalidad"] == "email_pass"
+                   else "un link que empiece con <code>https://</code>")
+        detalle = "\n".join(f"{n} ➔ <code>{esc(l[:70])}</code>" for n, l in errores[:10])
+        mas = f"\n… y {len(errores) - 10} más" if len(errores) > 10 else ""
+        bot.reply_to(message,
+                     f"❌ <b>Formato inválido — no se cargó nada.</b>\n\nCada línea debe ser {formato}.\n\n"
+                     f"<b>Líneas con error ({len(errores)}):</b>\n{detalle}{mas}\n\n"
+                     "Corrígelas y envía el bloque completo de nuevo.", reply_markup=boton_cancelar())
+        return True
+    unicas = list(dict.fromkeys(validas))
+    duplicadas = len(validas) - len(unicas)
     estado.pop(ADMIN_ID, None)
-    es_foto = message.content_type == "photo"
-    aviso = bot.reply_to(message, "📢 Enviando difusión en segundo plano... puedes seguir usando el bot.")
-    Thread(target=_difundir, daemon=True, args=(
-        es_foto, message.photo[-1].file_id if es_foto else None, message.caption or "",
-        message.text or "", message.chat.id, aviso.message_id)).start()
+    with db() as conn:
+        with conn.cursor() as c:
+            execute_values(c, "INSERT INTO stock (producto, credenciales) VALUES %s",
+                           [(producto, l) for l in unicas], page_size=500)
+    invalidar_cache()
+    dup = f"\n🔁 Se omitieron <code>{duplicadas}</code> líneas repetidas." if duplicadas else ""
+    bot.reply_to(message, f"✅ <b>¡Carga exitosa!</b>\nSe agregaron <code>{len(unicas)}</code> accesos a <b>{esc(producto)}</b>.{dup}", reply_markup=boton_volver_menu())
+    return True
+
+
+def flujo_inf_activar(message, st):
+    texto = _texto_o_aviso(message)
+    if texto is None:
+        return True
+    if not texto or len(texto) > LIMITE_CONTENIDO:
+        bot.reply_to(message, f"❌ Envía un texto de hasta {LIMITE_CONTENIDO} caracteres.", reply_markup=boton_cancelar())
+        return True
+    producto = st["producto"]
+    estado.pop(ADMIN_ID, None)
+    q("UPDATE catalogo_db SET infinito = TRUE, entrega_infinita = %s WHERE producto = %s", (texto, producto), fetch=None)
+    invalidar_cache()
+    bot.reply_to(message, f"✅ <b>Stock infinito activado</b>\n♾️ <b>{esc(producto)}</b> ya nunca se agota y entregará:\n<code>{esc(texto)}</code>", reply_markup=boton_volver_menu())
+    return True
+
+
+# ---------- Íconos ----------
+def flujo_icono(message, st):
+    clave = st["clave"]
+    if message.content_type == "text" and (message.text or "").strip().lower() == "quitar":
+        q("DELETE FROM iconos WHERE clave = %s", (clave,), fetch=None)
+        _iconos_ids.pop(clave, None)
+        estado.pop(ADMIN_ID, None)
+        bot.reply_to(message, f"✅ Ícono de «{esc(ICONOS[clave][1])}» quitado (vuelve el emoji normal).", reply_markup=boton_volver_menu())
+        return True
+    entidades = [e for e in (message.entities or []) if e.type == "custom_emoji"]
+    if not entidades:
+        bot.reply_to(message, "⚠️ No detecté un <b>emoji premium</b>. Envía un emoji personalizado (o escribe <code>quitar</code>).", reply_markup=boton_cancelar())
+        return True
+    eid = entidades[0].custom_emoji_id
+    q("INSERT INTO iconos (clave, emoji_id) VALUES (%s, %s) ON CONFLICT (clave) DO UPDATE SET emoji_id = EXCLUDED.emoji_id", (clave, eid), fetch=None)
+    _iconos_ids[clave] = eid
+    estado.pop(ADMIN_ID, None)
+    bot.reply_to(message, f"✅ Ícono asignado a «{esc(ICONOS[clave][1])}»: {ic(clave)}\n\nUsa /iconos para asignar más o «Probar íconos».", reply_markup=boton_volver_menu())
+    return True
+
+
+# ---------- Anuncio global ----------
+def flujo_noti_global(message, st):
+    """Paso 1: el admin envía el anuncio. Paso 2: elige el botón (callbacks 'nt:')."""
+    total = q("SELECT COUNT(*) FROM usuarios", fetch="one")[0]
+    set_estado(ADMIN_ID, "noti_botones", src_chat=message.chat.id, src_msg=message.message_id, total=total, opt=None)
+    m = InlineKeyboardMarkup(row_width=1)
+    m.add(btn("Botón: Ver Catálogo", "nt:cat", style=VERDE, icono="tienda"))
+    for prod, info in catalogo_completo().items():
+        if info["disponible"]:
+            m.add(btn(f"Botón COMPRAR: {prod}", f"nt:{tok(prod)}", style=VERDE, icono="pagar"))
+    m.add(btn("Enviar sin botones", "nt:none", style=AZUL, icono="rayo"), btn("Cancelar", "inicio", style=ROJO, icono="error"))
+    bot.reply_to(message, "✅ <b>Anuncio recibido.</b>\n\n👇 Elige el botón que llevará el mensaje y te mostraré una vista previa:", reply_markup=m)
     return True
 
 
@@ -1468,31 +2230,12 @@ def flujo_noti_user(message, st):
     return True
 
 
-def flujo_carga(message, st):
-    texto = _texto_o_aviso(message, "⚠️ Envía las cuentas/links como texto.")
-    if texto is None:
-        return True
-    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
-    if not lineas:
-        bot.reply_to(message, "❌ El bloque está vacío.", reply_markup=boton_cancelar())
-        return True
-    estado.pop(ADMIN_ID, None)
-    producto = st["producto"]
-    with db() as conn:
-        with conn.cursor() as c:
-            execute_values(c, "INSERT INTO stock (producto, credenciales) VALUES %s",
-                           [(producto, l) for l in lineas], page_size=500)
-    invalidar_cache()
-    bot.reply_to(message, f"✅ <b>¡Carga exitosa!</b>\nSe agregaron <code>{len(lineas)}</code> accesos a <b>{esc(producto)}</b>.", reply_markup=boton_volver_menu())
-    return True
-
-
 def flujo_soporte(message, st):
     estado.pop(message.from_user.id, None)
     uid, uname, nombre, _ = obtener_datos_usuario(message.from_user.id)
     header = f"🆘 <b>REPORTE DE SOPORTE</b>\n\n👤 {esc(nombre)} (<code>{esc(uname)}</code>)\n🆔 <code>{uid}</code>"
     m = InlineKeyboardMarkup()
-    m.add(btn("📨 Responder", f"noti:{uid}", style=VERDE))
+    m.add(btn("Responder", f"noti:{uid}", style=VERDE, icono="soporte"))
     if message.content_type == "photo":
         bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"{header}\n\n{esc(message.caption or '')}", reply_markup=m)
     else:
@@ -1501,38 +2244,46 @@ def flujo_soporte(message, st):
     return True
 
 
-# ---------- COMPRA: correo + verificación del pago ----------
+# ---------- Compra ----------
 def flujo_compra(message, st):
     user_id = message.from_user.id
     es_texto = message.content_type == "text"
     texto = (message.text or "").strip() if es_texto else ""
+    paso = st.get("paso")
 
-    # (a) Esperando el correo para productos "a correo"
-    if st["tipo"] == "correo":
+    if paso == "correo":
         if not es_texto:
-            bot.reply_to(message, "⚠️ Envía tu correo como texto.")
+            bot.reply_to(message, "⚠️ Envía tu correo como texto.\n<b>Ejemplo:</b> <code>micorreo@gmail.com</code>", reply_markup=boton_cancelar("catalogo"))
             return True
-        if "@" not in texto or "." not in texto.split("@")[-1] or " " in texto or len(texto) > 120:
-            bot.reply_to(message, "⚠️ Correo inválido. Escribe un correo correcto:")
+        if not RE_CORREO.match(texto) or len(texto) > 120:
+            bot.reply_to(message, "⚠️ Correo inválido. Escríbelo así:\n<b>Ejemplo:</b> <code>micorreo@gmail.com</code>", reply_markup=boton_cancelar("catalogo"))
             return True
-        producto = st["producto"]
-        total = a_dec(precio_en_vivo(producto))
-        set_estado(user_id, "compra", tipo="pago_correo", producto=producto, cantidad=1, correo=texto,
-                   total=total, creado_ms=int(time.time() * 1000))
-        enviar_pago(message.chat.id, texto_instrucciones_pago(producto, 1, total, correo=texto))
+        st["correo"] = texto
+        mostrar_pago(message.chat.id, st, f"{ic('correo')} <b>Correo:</b> <code>{esc(texto)}</code>\n")
         return True
 
-    # (b) Esperando el ID de orden de Binance
-    if st["tipo"] not in ("stock", "pago_correo") or "total" not in st:
-        bot.reply_to(message, "💡 Primero pulsa <b>Pagar</b> en tu pedido, o usa /buy para elegir un producto.", reply_markup=boton_volver_menu())
+    if paso == "usuario":
+        if not es_texto or not RE_USUARIO_TG.match(texto):
+            bot.reply_to(message, "⚠️ Usuario inválido. Envía tu @usuario de Telegram.\n<b>Ejemplo:</b> <code>@miusuario</code>", reply_markup=boton_cancelar("catalogo"))
+            return True
+        st["tg_user"] = "@" + texto.lstrip("@")
+        mostrar_pago(message.chat.id, st, f"{ic('dominio')} <b>Usuario de Telegram:</b> <code>{esc(st['tg_user'])}</code>\n")
         return True
+
+    if paso == "elegir":
+        bot.reply_to(message, "👆 Usa los botones de la plataforma para elegir la cantidad y pagar.", reply_markup=boton_volver_menu())
+        return True
+
+    # paso "pago" o "id": se espera el ID de orden
     if not es_texto:
-        bot.reply_to(message, "⚠️ Envía el <b>ID de orden</b> como texto para validar tu pago.", reply_markup=boton_volver_menu())
+        bot.reply_to(message, "⚠️ Envía el <b>ID de orden</b> como texto.\n<b>Ejemplo:</b> <code>463440249244098560</code>", reply_markup=boton_cancelar("catalogo"))
         return True
-
     order_id = "".join(texto.split())
     if not order_id.isalnum() or len(order_id) < 8:
-        bot.reply_to(message, "⚠️ ID de orden no válido. Copia el <b>ID de orden</b> exacto desde tu comprobante de Binance.", reply_markup=boton_volver_menu())
+        if paso == "pago":
+            bot.reply_to(message, "ℹ️ Cuando hayas pagado, pulsa <b>Ya pagué</b> en el mensaje del pago y envía tu ID de orden.", reply_markup=boton_cancelar("catalogo"))
+        else:
+            bot.reply_to(message, "⚠️ ID de orden no válido. Copia el <b>ID de orden</b> exacto de tu comprobante.\n<b>Ejemplo:</b> <code>463440249244098560</code>", reply_markup=boton_cancelar("catalogo"))
         return True
 
     with _pagos_lock:
@@ -1552,8 +2303,8 @@ def procesar_pago(message, st, order_id):
     chat_id = message.chat.id
     producto = st["producto"]
     cantidad = st.get("cantidad", 1)
-    tipo = st["tipo"]
     correo = st.get("correo")
+    tg_user = st.get("tg_user")
     total = st["total"]
 
     if q("SELECT 1 FROM pagos_usados WHERE order_id = %s", (order_id,), "one"):
@@ -1565,44 +2316,67 @@ def procesar_pago(message, st, order_id):
     if not ok:
         editar_o_enviar(chat_id, espera.message_id,
                         f"❌ <b>Pago no verificado</b>\n\n{esc(resultado)}\n\n🔁 Puedes pegar el ID de orden nuevamente.",
-                        boton_volver_menu())
+                        boton_cancelar("catalogo"))
         return
 
     monto_pagado = resultado
     precio_total = float(total)
     resultado_tx = None
     entregadas = []
+    mod_final = None
 
     with db() as conn:
         with conn.cursor() as c:
-            # Reserva atómica del order_id (evita doble canje)
             c.execute("INSERT INTO pagos_usados (order_id, user_id, monto) VALUES (%s, %s, %s) "
                       "ON CONFLICT (order_id) DO NOTHING", (order_id, user_id, monto_pagado))
             if c.rowcount == 0:
                 resultado_tx = "usado"
-            elif tipo == "pago_correo":
-                c.execute("INSERT INTO historial_compras (user_id, producto, credenciales, precio) VALUES (%s, %s, %s, %s)",
-                          (user_id, producto, f"Activación a correo: {correo}", precio_total))
-                c.execute("UPDATE usuarios SET compras = compras + 1 WHERE user_id = %s", (user_id,))
-                resultado_tx = "ok_correo"
             else:
-                c.execute("SELECT id, credenciales FROM stock WHERE producto = %s AND vendido = 0 "
-                          "ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED", (producto, cantidad))
-                filas = c.fetchall()
-                if len(filas) < cantidad:
-                    conn.rollback()  # el pago NO queda consumido
+                c.execute("SELECT modalidad, infinito, entrega_infinita FROM catalogo_db WHERE producto = %s", (producto,))
+                fila = c.fetchone()
+                if not fila:
+                    conn.rollback()
                     resultado_tx = "sin_stock"
                 else:
-                    ids = [f[0] for f in filas]
-                    entregadas = [f[1] for f in filas]
-                    c.execute("UPDATE stock SET vendido = 1 WHERE id = ANY(%s)", (ids,))
-                    c.execute("UPDATE usuarios SET compras = compras + 1 WHERE user_id = %s", (user_id,))
-                    c.execute("INSERT INTO historial_compras (user_id, producto, credenciales, precio) VALUES (%s, %s, %s, %s)",
-                              (user_id, producto, " | ".join(entregadas), precio_total))
-                    c.execute("INSERT INTO entregas_pendientes (order_id, user_id, producto, credenciales) "
-                              "VALUES (%s, %s, %s, %s) ON CONFLICT (order_id) DO NOTHING",
-                              (order_id, user_id, producto, " | ".join(entregadas)))
-                    resultado_tx = "ok_stock"
+                    mod_final, inf_db, ent_db = fila
+                    if mod_final in MANUALES:
+                        detalle = (f"Activación a correo: {correo or '(no indicado)'}" if mod_final == "correo"
+                                   else f"A dominio — Telegram: {tg_user or '(no indicado)'}")
+                        c.execute("INSERT INTO historial_compras (user_id, producto, credenciales, precio) VALUES (%s, %s, %s, %s)",
+                                  (user_id, producto, detalle, precio_total))
+                        c.execute("UPDATE usuarios SET compras = compras + 1 WHERE user_id = %s", (user_id,))
+                        resultado_tx = "ok_manual"
+                    elif inf_db:
+                        if not (ent_db or "").strip():
+                            conn.rollback()
+                            resultado_tx = "sin_stock"
+                        else:
+                            entregadas = [ent_db] * cantidad
+                            c.execute("UPDATE usuarios SET compras = compras + 1 WHERE user_id = %s", (user_id,))
+                            c.execute("INSERT INTO historial_compras (user_id, producto, credenciales, precio) VALUES (%s, %s, %s, %s)",
+                                      (user_id, producto, " | ".join(entregadas), precio_total))
+                            c.execute("INSERT INTO entregas_pendientes (order_id, user_id, producto, credenciales) "
+                                      "VALUES (%s, %s, %s, %s) ON CONFLICT (order_id) DO NOTHING",
+                                      (order_id, user_id, producto, " | ".join(entregadas)))
+                            resultado_tx = "ok_stock"
+                    else:
+                        c.execute("SELECT id, credenciales FROM stock WHERE producto = %s AND vendido = 0 "
+                                  "ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED", (producto, cantidad))
+                        filas = c.fetchall()
+                        if len(filas) < cantidad:
+                            conn.rollback()  # el pago NO queda consumido
+                            resultado_tx = "sin_stock"
+                        else:
+                            ids = [f[0] for f in filas]
+                            entregadas = [f[1] for f in filas]
+                            c.execute("UPDATE stock SET vendido = 1 WHERE id = ANY(%s)", (ids,))
+                            c.execute("UPDATE usuarios SET compras = compras + 1 WHERE user_id = %s", (user_id,))
+                            c.execute("INSERT INTO historial_compras (user_id, producto, credenciales, precio) VALUES (%s, %s, %s, %s)",
+                                      (user_id, producto, " | ".join(entregadas), precio_total))
+                            c.execute("INSERT INTO entregas_pendientes (order_id, user_id, producto, credenciales) "
+                                      "VALUES (%s, %s, %s, %s) ON CONFLICT (order_id) DO NOTHING",
+                                      (order_id, user_id, producto, " | ".join(entregadas)))
+                            resultado_tx = "ok_stock"
 
     # ---- La base de datos ya terminó; ahora se notifica ----
     if resultado_tx == "usado":
@@ -1613,7 +2387,7 @@ def procesar_pago(message, st, order_id):
         invalidar_cache()
         editar_o_enviar(
             chat_id, espera.message_id,
-            "⚠️ <b>Pago verificado, pero el stock se agotó justo ahora.</b>\n\n"
+            "⚠️ <b>Pago verificado, pero el producto ya no está disponible.</b>\n\n"
             f"Contacta al administrador (@{esc(ADMIN_USERNAME.lstrip('@'))}) con tu Order ID <code>{order_id}</code> para reposición o reembolso.",
             boton_volver_menu())
         avisar_admin(f"⚠️ <b>PAGO SIN STOCK</b>\nUsuario <code>{user_id}</code> pagó <code>{monto_pagado:.2f} USDT</code> por <b>{esc(producto)}</b> x{cantidad}, pero no hay stock.\n🧾 <code>{order_id}</code>")
@@ -1621,35 +2395,58 @@ def procesar_pago(message, st, order_id):
 
     estado.pop(user_id, None)
     uid, uname, nombre, _ = obtener_datos_usuario(user_id)
+    responder = InlineKeyboardMarkup()
+    responder.add(btn("Responder al cliente", f"noti:{uid}", style=VERDE, icono="soporte"))
 
-    if resultado_tx == "ok_correo":
-        editar_o_enviar(
-            chat_id, espera.message_id,
-            "✅ <b>¡PAGO VERIFICADO CON ÉXITO!</b>\n\n"
-            f"📦 Producto: {esc(producto)}\n"
-            f"📧 Correo: <code>{esc(correo)}</code>\n"
-            f"💵 Pagado: <code>{monto_pagado:.2f} USDT</code>\n"
-            f"🧾 Order ID: <code>{order_id}</code>\n\n"
-            "⏳ Tu activación se procesará de inmediato.",
-            boton_volver_menu())
-        avisar_admin(
-            "🔔 <b>NUEVA VENTA VERIFICADA (CORREO)</b>\n\n"
-            f"👤 {esc(nombre)} (<code>{esc(uname)}</code>)\n🆔 <code>{uid}</code>\n"
-            f"📦 {esc(producto)}\n📧 <code>{esc(correo)}</code>\n"
-            f"💵 <code>{monto_pagado:.2f} USDT</code>\n🧾 <code>{order_id}</code>")
+    if resultado_tx == "ok_manual":
+        if mod_final == "correo":
+            editar_o_enviar(
+                chat_id, espera.message_id,
+                f"{ic('ok')} <b>¡PAGO VERIFICADO CON ÉXITO!</b>\n\n"
+                f"{ic('tienda')} <b>Producto:</b> {esc(producto)}\n"
+                f"{ic('correo')} <b>Correo:</b> <code>{esc(correo)}</code>\n"
+                f"{ic('pagar')} <b>Pagado:</b> <code>{monto_pagado:.2f} USDT</code>\n"
+                f"<b>Order ID:</b> <code>{order_id}</code>\n\n"
+                "⏳ El administrador te enviará la invitación/activación a tu correo y te avisará por aquí.",
+                boton_volver_menu())
+            avisar_admin(
+                "🔔 <b>NUEVA VENTA · ACTIVACIÓN A CORREO</b>\n\n"
+                f"👤 {esc(nombre)} (<code>{esc(uname)}</code>)\n🆔 <code>{uid}</code>\n"
+                f"📦 {esc(producto)}\n📧 <code>{esc(correo)}</code>\n"
+                f"💵 <code>{monto_pagado:.2f} USDT</code>\n🧾 <code>{order_id}</code>\n\n"
+                "👉 Envía la invitación y avísale con el botón.", responder)
+        else:
+            m = InlineKeyboardMarkup(row_width=1)
+            m.add(boton_admin_url(), btn("Menú Principal", "inicio", style=AZUL, icono="menu"))
+            editar_o_enviar(
+                chat_id, espera.message_id,
+                f"{ic('ok')} <b>¡PAGO VERIFICADO CON ÉXITO!</b>\n\n"
+                f"{ic('tienda')} <b>Producto:</b> {esc(producto)}\n"
+                f"{ic('dominio')} <b>Tu usuario:</b> <code>{esc(tg_user)}</code>\n"
+                f"{ic('pagar')} <b>Pagado:</b> <code>{monto_pagado:.2f} USDT</code>\n"
+                f"<b>Order ID:</b> <code>{order_id}</code>\n\n"
+                "👇 <b>Contacta ahora con el administrador</b> para coordinar la entrega de tus datos. "
+                f"Menciona tu Order ID.\n<b>Ejemplo de mensaje:</b> <code>Hola, compré {esc(producto)}. Mi Order ID es {order_id}</code>",
+                m)
+            avisar_admin(
+                "🔔 <b>NUEVA VENTA · A DOMINIO</b>\n\n"
+                f"👤 {esc(nombre)} (<code>{esc(uname)}</code>)\n🆔 <code>{uid}</code>\n"
+                f"📦 {esc(producto)}\n💬 Telegram del cliente: <code>{esc(tg_user)}</code>\n"
+                f"💵 <code>{monto_pagado:.2f} USDT</code>\n🧾 <code>{order_id}</code>\n\n"
+                "👉 El cliente te escribirá para coordinar. También puedes contactarlo con el botón.", responder)
         return
 
-    # ok_stock
+    # ok_stock (normal o infinito)
     invalidar_cache()
     bloque = "\n".join(f"• <code>{esc(x)}</code>" for x in entregadas)
     entregado = editar_o_enviar(
         chat_id, espera.message_id,
-        "✨ <b>SA SHOP · ENTREGA CONFIRMADA</b>\n\n"
-        f"📦 Producto: <code>{esc(producto)}</code> (x{cantidad})\n"
-        f"💵 Pagado: <code>{monto_pagado:.2f} USDT</code>\n"
-        f"🧾 Order ID: <code>{order_id}</code>\n\n"
-        f"🔑 <b>Tus accesos:</b>\n{bloque}\n\n"
-        "¡Gracias por tu compra en SA SHOP! ⚡",
+        f"{ic('ok')} <b>SA SHOP · ENTREGA CONFIRMADA</b>\n\n"
+        f"{ic('tienda')} <b>Producto:</b> <code>{esc(producto)}</code> (x{cantidad})\n"
+        f"{ic('pagar')} <b>Pagado:</b> <code>{monto_pagado:.2f} USDT</code>\n"
+        f"<b>Order ID:</b> <code>{order_id}</code>\n\n"
+        f"{ic('rayo')} <b>Tus accesos:</b>\n{bloque}\n\n"
+        "¡Gracias por tu compra en SA SHOP!",
         boton_volver_menu())
     if entregado:
         try:
@@ -1670,9 +2467,12 @@ FLUJOS = {
     "mod_desc": flujo_mod_desc,
     "precio": flujo_precio,
     "agregar": flujo_agregar,
-    "noti_global": flujo_noti_global,
-    "noti_user": flujo_noti_user,
     "carga": flujo_carga,
+    "inf_activar": flujo_inf_activar,
+    "icono": flujo_icono,
+    "noti_global": flujo_noti_global,
+    "noti_botones": flujo_noti_global,
+    "noti_user": flujo_noti_user,
     "soporte": flujo_soporte,
     "compra": flujo_compra,
 }
